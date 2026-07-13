@@ -42,9 +42,21 @@ class MonteCarloResult(TypedDict):
 
 
 def _finite_number(value: Number, *, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError(f"{name} must be a finite number", context={name: value})
-    return float(value)
+    try:
+        normalized = float(value)
+    except OverflowError as error:
+        raise ValidationError(f"{name} must be a finite number", context={name: value}) from error
+    if not math.isfinite(normalized):
+        raise ValidationError(f"{name} must be a finite number", context={name: value})
+    return normalized
+
+
+def _positive_integer(value: Number, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValidationError(f"{name} must be a positive integer", context={name: value})
+    return value
 
 
 def _percentile(sorted_values: list[float], percentile: float) -> float:
@@ -93,20 +105,18 @@ def monte_carlo(
     Percentiles intentionally use the JavaScript source's floor-index selection,
     rather than interpolation.
     """
-    if not isinstance(trade_pnls, (list, tuple)) or not trade_pnls:
+    if (
+        isinstance(trade_pnls, (str, bytes))
+        or not isinstance(trade_pnls, Sequence)
+        or not trade_pnls
+    ):
         raise ValidationError(
             "trade_pnls must be a non-empty numeric sequence", context={"trade_pnls": trade_pnls}
         )
     pnls = [_finite_number(value, name="trade_pnls") for value in trade_pnls]
     starting_equity = _finite_number(equity_start, name="equity_start")
-    iteration_value = _finite_number(iterations, name="iterations")
-    block_value = _finite_number(block_size, name="block_size")
-    run_count = math.floor(iteration_value)
-    block = math.floor(block_value)
-    if run_count < 1:
-        raise ValidationError("iterations must be positive", context={"iterations": iterations})
-    if block < 1:
-        raise ValidationError("block_size must be positive", context={"block_size": block_size})
+    run_count = _positive_integer(iterations, name="iterations")
+    block = _positive_integer(block_size, name="block_size")
 
     if rng is not None and not callable(rng):
         raise ValidationError("rng must be callable", context={"rng": rng})
@@ -154,5 +164,5 @@ def monte_carlo(
         "final_equity": _bands(sorted_finals),
         "max_drawdown": _bands(sorted_drawdowns),
         "path_bands": path_bands,
-        "prob_profit": profitable / iteration_value,
+        "prob_profit": profitable / run_count,
     }

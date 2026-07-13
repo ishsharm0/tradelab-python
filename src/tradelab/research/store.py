@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
-from collections.abc import Callable, Mapping
-from contextlib import suppress
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict
@@ -16,6 +19,10 @@ from tradelab.errors import ValidationError
 
 _DEFAULT_DIRECTORY = Path(".tradelab/research")
 _SAFE_ID = re.compile(r"^[\w.-]+$", re.ASCII)
+_LOCK_TIMEOUT_SECONDS = 5.0
+_STALE_LOCK_SECONDS = 30.0
+_LOCK_POLL_SECONDS = 0.01
+_thread_lock_guard = threading.Lock()
 
 
 class ResearchEntry(TypedDict):
@@ -54,6 +61,136 @@ class ResearchRecall(TypedDict):
     summary: str
 
 
+class _ThreadRecordLock:
+    """A typed wrapper around a re-entrant lock shared by store instances."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+
+    def acquire(self) -> None:
+        self._lock.acquire()
+
+    def release(self) -> None:
+        self._lock.release()
+
+
+_thread_locks: dict[Path, _ThreadRecordLock] = {}
+
+
+def _thread_lock_for(path: Path) -> _ThreadRecordLock:
+    key = path.absolute()
+    with _thread_lock_guard:
+        lock = _thread_locks.get(key)
+        if lock is None:
+            lock = _ThreadRecordLock()
+            _thread_locks[key] = lock
+        return lock
+
+
+class _InterprocessRecordLock:
+    """Portable lock-file ownership with bounded waiting and stale-file recovery."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._acquired = False
+
+    def _owner_is_alive(self) -> bool:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            pid = payload.get("pid") if isinstance(payload, dict) else None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _remove_stale_file(self) -> bool:
+        try:
+            modified_at = self.path.stat().st_mtime
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise ValidationError(
+                "unable to inspect research lock",
+                context={"lock_path": str(self.path), "error": str(error)},
+            ) from error
+        if time.time() - modified_at <= _STALE_LOCK_SECONDS or self._owner_is_alive():
+            return False
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise ValidationError(
+                "unable to remove stale research lock",
+                context={"lock_path": str(self.path), "error": str(error)},
+            ) from error
+        return True
+
+    def acquire(self) -> None:
+        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                if self._remove_stale_file():
+                    continue
+                if time.monotonic() >= deadline:
+                    raise ValidationError(
+                        "timed out acquiring research record lock",
+                        context={
+                            "lock_path": str(self.path),
+                            "timeout_seconds": _LOCK_TIMEOUT_SECONDS,
+                        },
+                    ) from None
+                time.sleep(_LOCK_POLL_SECONDS)
+                continue
+            except OSError as error:
+                raise ValidationError(
+                    "unable to acquire research record lock",
+                    context={"lock_path": str(self.path), "error": str(error)},
+                ) from error
+            try:
+                metadata = json.dumps(
+                    {"pid": os.getpid(), "created_at": time.time()}
+                ).encode("utf-8")
+                os.write(descriptor, metadata)
+            except OSError as error:
+                with suppress(OSError):
+                    self.path.unlink()
+                raise ValidationError(
+                    "unable to initialize research record lock",
+                    context={"lock_path": str(self.path), "error": str(error)},
+                ) from error
+            finally:
+                os.close(descriptor)
+            self._acquired = True
+            return
+
+    def release(self) -> None:
+        if not self._acquired:
+            return
+        self._acquired = False
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ValidationError(
+                "unable to release research record lock",
+                context={"lock_path": str(self.path), "error": str(error)},
+            ) from error
+
+
 def _timestamp(clock: Callable[[], datetime]) -> str:
     value = clock()
     if not isinstance(value, datetime):
@@ -71,32 +208,93 @@ def _validate_id(record_id: str) -> str:
     return record_id
 
 
-def _entry_from_mapping(value: object) -> ResearchEntry | None:
+def _normalize_json_value(value: object, *, field: str, seen: set[int] | None = None) -> Any:
+    """Return portable JSON data, rejecting non-finite and unsupported values."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValidationError(
+                "research data must use finite JSON numbers", context={"field": field}
+            )
+        return value
+    if seen is None:
+        seen = set()
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen:
+            raise ValidationError("research data cannot contain cycles", context={"field": field})
+        seen.add(identity)
+        try:
+            normalized: dict[str, Any] = {}
+            for key, nested_value in value.items():
+                if not isinstance(key, str):
+                    raise ValidationError(
+                        "research JSON object keys must be strings", context={"field": field}
+                    )
+                normalized[key] = _normalize_json_value(
+                    nested_value, field=f"{field}.{key}", seen=seen
+                )
+            return normalized
+        finally:
+            seen.remove(identity)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        identity = id(value)
+        if identity in seen:
+            raise ValidationError("research data cannot contain cycles", context={"field": field})
+        seen.add(identity)
+        try:
+            return [
+                _normalize_json_value(nested_value, field=f"{field}[{index}]", seen=seen)
+                for index, nested_value in enumerate(value)
+            ]
+        finally:
+            seen.remove(identity)
+    raise ValidationError(
+        "research data must contain only portable JSON values",
+        context={"field": field, "type": type(value).__name__},
+    )
+
+
+def _normalized_object(value: object, *, field: str) -> dict[str, Any]:
+    normalized = _normalize_json_value(value, field=field)
+    if not isinstance(normalized, dict):
+        raise ValidationError("research data must be a JSON object", context={"field": field})
+    return normalized
+
+
+def _entry_from_mapping(value: object) -> ResearchEntry:
     if not isinstance(value, Mapping):
-        return None
+        raise ValidationError("research entry must be an object")
     at = value.get("at")
     hypothesis = value.get("hypothesis")
     params = value.get("params")
     metrics = value.get("metrics")
     verdict = value.get("verdict")
     if not isinstance(at, str) or not isinstance(hypothesis, str):
-        return None
-    if not isinstance(params, dict) or not isinstance(metrics, dict):
-        return None
-    if verdict is not None and not isinstance(verdict, dict):
-        return None
+        raise ValidationError("research entry requires string at and hypothesis values")
+    normalized_params = _normalized_object(params, field="params")
+    normalized_metrics = _normalized_object(metrics, field="metrics")
+    if verdict is None:
+        normalized_verdict: dict[str, Any] | None = None
+    else:
+        normalized_verdict = _normalized_object(verdict, field="verdict")
+        if "overfit" in normalized_verdict and type(normalized_verdict["overfit"]) is not bool:
+            raise ValidationError("verdict.overfit must be a boolean")
     return {
         "at": at,
         "hypothesis": hypothesis,
-        "params": params,
-        "metrics": metrics,
-        "verdict": verdict,
+        "params": normalized_params,
+        "metrics": normalized_metrics,
+        "verdict": normalized_verdict,
     }
 
 
-def _record_from_mapping(value: object) -> ResearchRecord | None:
+def _record_from_mapping(value: object) -> ResearchRecord:
     if not isinstance(value, Mapping):
-        return None
+        raise ValidationError("research record must be an object")
     record_id = value.get("id")
     goal = value.get("goal")
     created_at = value.get("created_at")
@@ -107,23 +305,18 @@ def _record_from_mapping(value: object) -> ResearchRecord | None:
         or not isinstance(goal, str)
         or not isinstance(created_at, str)
     ):
-        return None
+        raise ValidationError("research record requires string id, goal, and created_at values")
+    _validate_id(record_id)
     if closed_at is not None and not isinstance(closed_at, str):
-        return None
+        raise ValidationError("research record closed_at must be a string or null")
     if not isinstance(entries, list):
-        return None
-    normalized_entries: list[ResearchEntry] = []
-    for entry in entries:
-        normalized = _entry_from_mapping(entry)
-        if normalized is None:
-            return None
-        normalized_entries.append(normalized)
+        raise ValidationError("research record entries must be an array")
     return {
         "id": record_id,
         "goal": goal,
         "created_at": created_at,
         "closed_at": closed_at,
-        "entries": normalized_entries,
+        "entries": [_entry_from_mapping(entry) for entry in entries],
     }
 
 
@@ -135,23 +328,18 @@ def best_sharpe(entries: list[ResearchEntry]) -> BestSharpe | None:
         if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
             continue
         sharpe = float(candidate)
-        if not math_isfinite(sharpe):
+        if not math.isfinite(sharpe):
             continue
         if best is None or sharpe > best["sharpe"]:
             best = {"sharpe": sharpe, "params": entry["params"]}
     return best
 
 
-def math_isfinite(value: float) -> bool:
-    """Keep finite-number validation local without importing a broad numeric stack."""
-    return value != float("inf") and value != float("-inf") and value == value
-
-
 class ResearchStore:
     """Pathlib-backed synchronous store for durable research records.
 
-    Records are written through a same-directory temporary file, flushed and
-    fsynced before being atomically replaced at their final path.
+    Each mutation uses an in-process lock plus an atomic same-directory lock
+    file, then writes through a fsynced temporary file and ``os.replace``.
     """
 
     def __init__(
@@ -166,7 +354,27 @@ class ResearchStore:
     def _path_for(self, record_id: str) -> Path:
         return self.directory / f"{_validate_id(record_id)}.json"
 
+    def _lock_path_for(self, record_id: str) -> Path:
+        return self.directory / f".{_validate_id(record_id)}.lock"
+
+    @contextmanager
+    def _record_lock(self, record_id: str) -> Iterator[None]:
+        lock_path = self._lock_path_for(record_id)
+        thread_lock = _thread_lock_for(lock_path)
+        thread_lock.acquire()
+        interprocess_lock = _InterprocessRecordLock(lock_path)
+        try:
+            interprocess_lock.acquire()
+            try:
+                yield
+            finally:
+                interprocess_lock.release()
+        finally:
+            thread_lock.release()
+
     def _new_record(self, record_id: str, goal: str = "") -> ResearchRecord:
+        if not isinstance(goal, str):
+            raise ValidationError("goal must be a string", context={"goal": goal})
         return {
             "id": _validate_id(record_id),
             "goal": goal,
@@ -175,17 +383,23 @@ class ResearchStore:
             "entries": [],
         }
 
-    def _save(self, record: ResearchRecord) -> ResearchRecord:
-        path = self._path_for(record["id"])
+    def _save(self, record_id: str, record: ResearchRecord) -> ResearchRecord:
+        normalized = _record_from_mapping(record)
+        if normalized["id"] != record_id:
+            raise ValidationError(
+                "research record id does not match target path",
+                context={"requested_id": record_id, "record_id": normalized["id"]},
+            )
+        path = self._path_for(record_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path: Path | None = None
         try:
             descriptor, raw_temp_path = tempfile.mkstemp(
-                prefix=f".{record['id']}.", suffix=".tmp", dir=path.parent, text=True
+                prefix=f".{record_id}.", suffix=".tmp", dir=path.parent, text=True
             )
             temp_path = Path(raw_temp_path)
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(record, handle, indent=2, ensure_ascii=False)
+                json.dump(normalized, handle, indent=2, ensure_ascii=False, allow_nan=False)
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -195,21 +409,50 @@ class ResearchStore:
                 with suppress(OSError):
                     temp_path.unlink(missing_ok=True)
             raise
-        return record
+        return normalized
 
-    def load(self, record_id: str) -> ResearchRecord | None:
-        """Load one record, returning ``None`` when its file is absent or unreadable."""
+    def _load_unlocked(self, record_id: str) -> ResearchRecord | None:
         path = self._path_for(record_id)
         try:
             with path.open(encoding="utf-8") as handle:
-                return _record_from_mapping(json.load(handle))
-        except (OSError, json.JSONDecodeError):
+                loaded = json.load(handle)
+        except FileNotFoundError:
             return None
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as error:
+            raise ValidationError(
+                f"corrupt research record '{record_id}'", context={"path": str(path)}
+            ) from error
+        except OSError as error:
+            raise ValidationError(
+                f"unable to read research record '{record_id}'",
+                context={"path": str(path), "error": str(error)},
+            ) from error
+        try:
+            record = _record_from_mapping(loaded)
+        except ValidationError as error:
+            raise ValidationError(
+                f"invalid research record '{record_id}'", context={"path": str(path)}
+            ) from error
+        if record["id"] != record_id:
+            raise ValidationError(
+                f"research record '{record_id}' contains a different id",
+                context={"requested_id": record_id, "embedded_id": record["id"]},
+            )
+        return record
+
+    def load(self, record_id: str) -> ResearchRecord | None:
+        """Load one record, returning ``None`` only when its file is absent."""
+        _validate_id(record_id)
+        return self._load_unlocked(record_id)
 
     def open(self, record_id: str, goal: str = "") -> ResearchRecord:
         """Load an existing record or persist a newly opened investigation."""
-        record = self.load(record_id)
-        return record if record is not None else self._save(self._new_record(record_id, goal))
+        _validate_id(record_id)
+        with self._record_lock(record_id):
+            record = self._load_unlocked(record_id)
+            if record is not None:
+                return record
+            return self._save(record_id, self._new_record(record_id, goal))
 
     def log(
         self,
@@ -221,18 +464,24 @@ class ResearchStore:
         verdict: Mapping[str, Any] | None = None,
     ) -> ResearchEntry:
         """Append and persist an entry, implicitly opening a missing record."""
-        record = self.load(record_id)
-        if record is None:
-            record = self._new_record(record_id)
-        entry: ResearchEntry = {
-            "at": _timestamp(self._clock),
-            "hypothesis": hypothesis,
-            "params": dict(params or {}),
-            "metrics": dict(metrics or {}),
-            "verdict": dict(verdict) if verdict is not None else None,
-        }
-        record["entries"].append(entry)
-        self._save(record)
+        _validate_id(record_id)
+        if not isinstance(hypothesis, str):
+            raise ValidationError("hypothesis must be a string", context={"hypothesis": hypothesis})
+        entry = _entry_from_mapping(
+            {
+                "at": _timestamp(self._clock),
+                "hypothesis": hypothesis,
+                "params": {} if params is None else params,
+                "metrics": {} if metrics is None else metrics,
+                "verdict": verdict,
+            }
+        )
+        with self._record_lock(record_id):
+            record = self._load_unlocked(record_id)
+            if record is None:
+                record = self._new_record(record_id)
+            record["entries"].append(entry)
+            self._save(record_id, record)
         return entry
 
     def recall(self, record_id: str, limit: int = 10) -> ResearchRecall:
@@ -257,7 +506,9 @@ class ResearchStore:
         elif best is None:
             summary = f"Best Sharpe so far: n/a. {flagged} of {len(all_entries)} flagged overfit."
         else:
-            parameters = json.dumps(best["params"], separators=(",", ":"), ensure_ascii=False)
+            parameters = json.dumps(
+                best["params"], separators=(",", ":"), ensure_ascii=False, allow_nan=False
+            )
             summary = (
                 f"Best Sharpe so far: {best['sharpe']:.2f} via {parameters}. "
                 f"{flagged} of {len(all_entries)} flagged overfit."
@@ -280,11 +531,13 @@ class ResearchStore:
 
     def close(self, record_id: str) -> ResearchRecord:
         """Timestamp and persist record closure, implicitly creating it when missing."""
-        record = self.load(record_id)
-        if record is None:
-            record = self._new_record(record_id)
-        record["closed_at"] = _timestamp(self._clock)
-        return self._save(record)
+        _validate_id(record_id)
+        with self._record_lock(record_id):
+            record = self._load_unlocked(record_id)
+            if record is None:
+                record = self._new_record(record_id)
+            record["closed_at"] = _timestamp(self._clock)
+            return self._save(record_id, record)
 
 
 def create_research_store(

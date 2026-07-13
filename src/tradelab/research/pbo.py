@@ -20,6 +20,12 @@ class PboResult(TypedDict):
     median_logit: float
 
 
+def _finite_result(value: float, *, name: str) -> float:
+    if not math.isfinite(value):
+        raise ValidationError(f"performance_matrix produced a non-finite {name}")
+    return value
+
+
 def _sharpe(returns: list[float]) -> float:
     count = len(returns)
     if count < 2:
@@ -27,12 +33,13 @@ def _sharpe(returns: list[float]) -> float:
     total = 0.0
     for value in returns:
         total += value
-    mean = total / count
+    mean = _finite_result(total / count, name="mean")
     variance = 0.0
     for value in returns:
-        variance += (value - mean) ** 2
+        difference = value - mean
+        variance += difference * difference
     variance /= count - 1
-    standard_deviation = math.sqrt(variance)
+    standard_deviation = _finite_result(math.sqrt(variance), name="standard deviation")
     if standard_deviation == 0:
         if mean > 0:
             return math.inf
@@ -42,15 +49,21 @@ def _sharpe(returns: list[float]) -> float:
     return mean / standard_deviation
 
 
-def _validated_matrix(performance_matrix: Sequence[Sequence[Number]]) -> list[list[float]]:
-    if isinstance(performance_matrix, (str, bytes)) or len(performance_matrix) < 2:
+def _validated_matrix(performance_matrix: object) -> list[list[float]]:
+    strategy_count = (
+        len(performance_matrix)
+        if isinstance(performance_matrix, Sequence)
+        and not isinstance(performance_matrix, (str, bytes))
+        else 0
+    )
+    if (
+        isinstance(performance_matrix, (str, bytes))
+        or not isinstance(performance_matrix, Sequence)
+        or strategy_count < 2
+    ):
         raise ValidationError(
             "performance_matrix needs at least two strategies",
-            context={
-                "n_strategies": len(performance_matrix)
-                if not isinstance(performance_matrix, (str, bytes))
-                else 0
-            },
+            context={"n_strategies": strategy_count},
         )
     if not isinstance(performance_matrix[0], Sequence) or isinstance(
         performance_matrix[0], (str, bytes)
@@ -75,16 +88,24 @@ def _validated_matrix(performance_matrix: Sequence[Sequence[Number]]) -> list[li
             )
         values: list[float] = []
         for value in row:
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-            ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValidationError(
                     "performance_matrix values must be finite numbers",
                     context={"row": row_number, "value": value},
                 )
-            values.append(float(value))
+            try:
+                normalized_value = float(value)
+            except OverflowError as error:
+                raise ValidationError(
+                    "performance_matrix values must be finite numbers",
+                    context={"row": row_number, "value": value},
+                ) from error
+            if not math.isfinite(normalized_value):
+                raise ValidationError(
+                    "performance_matrix values must be finite numbers",
+                    context={"row": row_number, "value": value},
+                )
+            values.append(normalized_value)
         normalized.append(values)
     return normalized
 

@@ -25,11 +25,20 @@ def _finite(value: Number, *, name: str) -> float:
     return float(value)
 
 
+def _positive_integer(value: Number, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValidationError(f"{name} must be a positive integer", context={name: value})
+    return value
+
+
 def sweep_haircut(*, num_trials: Number, sharpe_std: Number) -> SweepHaircut:
     """Return the expected maximum null Sharpe from independent trials."""
-    trials_value = _finite(num_trials, name="num_trials")
+    trials = _positive_integer(num_trials, name="num_trials")
     standard_deviation = _finite(sharpe_std, name="sharpe_std")
-    trials = max(1, math.floor(trials_value))
+    if standard_deviation < 0:
+        raise ValidationError("sharpe_std must be non-negative", context={"sharpe_std": sharpe_std})
+    if trials == 1:
+        return {"expected_max_sharpe": 0.0, "num_trials": trials}
     a = normal_ppf(1 - 1 / trials)
     b = normal_ppf(1 - 1 / (trials * math.e))
     expected = standard_deviation * ((1 - _EULER_MASCHERONI) * a + _EULER_MASCHERONI * b)

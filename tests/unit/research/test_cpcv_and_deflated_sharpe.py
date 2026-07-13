@@ -40,6 +40,31 @@ def test_sweep_haircut_matches_the_expected_null_maximum() -> None:
     assert result["expected_max_sharpe"] == pytest.approx(0.49944341610694054)
 
 
+def test_sweep_haircut_uses_zero_null_sharpe_for_one_trial() -> None:
+    assert sweep_haircut(num_trials=1, sharpe_std=0.3) == {
+        "expected_max_sharpe": 0.0,
+        "num_trials": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("num_trials", "sharpe_std"),
+    [
+        (True, 0.3),
+        (1.5, 0.3),
+        (0, 0.3),
+        (-1, 0.3),
+        (1, -0.1),
+        (1, math.inf),
+    ],
+)
+def test_sweep_haircut_rejects_invalid_trial_count_and_standard_deviation(
+    num_trials: object, sharpe_std: object
+) -> None:
+    with pytest.raises(ValidationError):
+        sweep_haircut(num_trials=num_trials, sharpe_std=sharpe_std)  # type: ignore[arg-type]
+
+
 def test_deflated_sharpe_matches_fixture_and_bounds_probability() -> None:
     result = deflated_sharpe(
         sharpe=1.4,
