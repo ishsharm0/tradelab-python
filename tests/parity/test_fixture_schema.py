@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 EXPECTED_FIXTURES = {
@@ -59,7 +60,9 @@ EXPECTED_TA_CALLS = {
 }
 
 
-def test_manifest_identifies_the_javascript_oracle(load_fixture: object) -> None:
+def test_manifest_identifies_the_javascript_oracle(
+    load_fixture: Callable[[str], object],
+) -> None:
     """The manifest pins the reference implementation and deterministic fixture set."""
     manifest = load_fixture("manifest.json")
 
@@ -71,7 +74,7 @@ def test_manifest_identifies_the_javascript_oracle(load_fixture: object) -> None
 
 
 def test_declared_fixture_files_exist_and_are_valid_json(
-    fixture_dir: Path, load_fixture: object
+    fixture_dir: Path, load_fixture: Callable[[str], object]
 ) -> None:
     """Every manifest-declared oracle payload exists and is independently parseable."""
     manifest = load_fixture("manifest.json")
@@ -84,7 +87,9 @@ def test_declared_fixture_files_exist_and_are_valid_json(
         assert json.loads(path.read_text(encoding="utf-8")) is not None
 
 
-def test_fixture_payloads_preserve_replayable_inputs_and_outputs(load_fixture: object) -> None:
+def test_fixture_payloads_preserve_replayable_inputs_and_outputs(
+    load_fixture: Callable[[str], object],
+) -> None:
     """Fixtures retain every call's serializable input and its JavaScript output."""
     for filename, required_keys in REQUIRED_INPUT_KEYS.items():
         payload = load_fixture(filename)
@@ -99,7 +104,9 @@ def test_fixture_payloads_preserve_replayable_inputs_and_outputs(load_fixture: o
     assert set(ta_payload["input"]["calls"]) == EXPECTED_TA_CALLS
 
 
-def test_ta_fixture_covers_every_exported_indicator(load_fixture: object) -> None:
+def test_ta_fixture_covers_every_exported_indicator(
+    load_fixture: Callable[[str], object],
+) -> None:
     """TA parity data includes a direct oracle result for every public indicator."""
     fixture = load_fixture("ta.json")
 
