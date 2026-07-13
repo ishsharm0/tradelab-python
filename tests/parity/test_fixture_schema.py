@@ -68,6 +68,8 @@ def test_manifest_identifies_the_javascript_oracle(
 
     assert isinstance(manifest, dict)
     assert manifest["sourceVersion"] == "1.3.1"
+    assert manifest["sourceCommit"] == "a9030e9f92feaaedad22a0fdf8ecc3a6bcc1c4f0"
+    assert manifest["sourceDirty"] is False
     assert manifest["seed"] == 42
     assert manifest["fixtures"] == EXPECTED_FIXTURES
     assert manifest["sourcePaths"] == EXPECTED_SOURCE_PATHS

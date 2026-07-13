@@ -1,14 +1,28 @@
 #!/usr/bin/env node
 
+import { execFile } from "node:child_process";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 
 const SEED = 42;
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PYTHON_ROOT = resolve(SCRIPT_DIR, "..");
 const JS_ROOT = resolve(PYTHON_ROOT, "..", "tradelab");
 const FIXTURE_DIR = resolve(PYTHON_ROOT, "tests", "parity", "fixtures");
+
+const execFileAsync = promisify(execFile);
+const { stdout: sourceCommitOutput } = await execFileAsync("git", ["-C", JS_ROOT, "rev-parse", "HEAD"], {
+  encoding: "utf8",
+});
+const { stdout: sourceStatus } = await execFileAsync("git", ["-C", JS_ROOT, "status", "--porcelain"], {
+  encoding: "utf8",
+});
+if (sourceStatus) {
+  throw new Error(`Refusing to generate parity fixtures: JavaScript source checkout is dirty at ${JS_ROOT}. Commit or stash its changes first.`);
+}
+const sourceCommit = sourceCommitOutput.trim();
 
 const sourcePaths = {
   ta: "src/ta/index.js",
@@ -469,6 +483,8 @@ await writeFixture(fixtures.portfolio, {
 const packageJson = JSON.parse(await readFile(resolve(JS_ROOT, "package.json"), "utf8"));
 await writeFixture("manifest.json", {
   sourceVersion: packageJson.version,
+  sourceCommit,
+  sourceDirty: false,
   seed: SEED,
   fixtures,
   sourcePaths: Object.fromEntries(
