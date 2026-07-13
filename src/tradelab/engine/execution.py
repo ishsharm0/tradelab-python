@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from tradelab.errors import ValidationError
-from tradelab.utils.time import minutes_et
+from tradelab.utils.time import NEW_YORK, minutes_et
 
 
 def _number(value: object, name: str, default: float | None = None) -> float:
@@ -242,6 +242,10 @@ def day_key_utc(time_ms: float) -> str:
 
 
 def day_key_et(time_ms: float) -> str:
-    # Match the immutable JS oracle: it anchors the ET wall clock to the input's
-    # UTC calendar date, so the resulting key is always that UTC date.
-    return day_key_utc(time_ms)
+    value = _number(time_ms, "time_ms")
+    try:
+        return datetime.fromtimestamp(value / 1_000, UTC).astimezone(NEW_YORK).strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, OSError) as error:
+        raise ValidationError(
+            "time_ms must be Unix milliseconds", context={"time_ms": time_ms}
+        ) from error

@@ -9,8 +9,10 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, overload
+from inspect import isawaitable
+from typing import Any, NoReturn, overload
 
 from tradelab.errors import ValidationError
 from tradelab.metrics import build_metrics
@@ -220,6 +222,20 @@ def _js_round_nonnegative(value: float) -> int:
     return math.floor(value + 0.5)
 
 
+def _raise_contextual_signal_error(
+    error: Exception,
+    context: dict[str, object],
+    index: int,
+    bar: Mapping[str, object],
+    symbol: str,
+) -> NoReturn:
+    def rethrow(_context: dict[str, object]) -> object:
+        raise error
+
+    call_signal_with_context(rethrow, context, index, bar, symbol)
+    raise AssertionError("signal error wrapper returned")  # pragma: no cover
+
+
 class _StrictHistory(Sequence[dict[str, Any]]):
     """Read-only no-lookahead history view mirroring the JavaScript proxy."""
 
@@ -243,6 +259,14 @@ class _StrictHistory(Sequence[dict[str, Any]]):
 
     def __len__(self) -> int:
         return len(self._values)
+
+
+@dataclass(frozen=True, slots=True)
+class _SignalPreparation:
+    bar: dict[str, Any]
+    context: dict[str, object]
+    signal_equity: float | None
+    resolve_entry_size: Callable[[dict[str, object]], object] | None
 
 
 class BarSystemRunner:
@@ -732,7 +756,11 @@ class BarSystemRunner:
             )
         return True
 
-    def _manage_open(self, bar: Mapping[str, Any]) -> None:
+    def _manage_open(
+        self,
+        bar: Mapping[str, Any],
+        resolve_entry_size: Callable[[dict[str, object]], object] | None = None,
+    ) -> None:
         assert self.open is not None
         open_pos = self.open
         risk = float(open_pos["_initRisk"])
@@ -867,6 +895,27 @@ class BarSystemRunner:
                 * float(self.pyramiding["addFrac"]),
                 self.qty_step,
             )
+            if be and touched and resolve_entry_size is not None:
+                qty = round_step(
+                    _finite(
+                        resolve_entry_size(
+                            {
+                                "runner": self,
+                                "desired_size": qty,
+                                "entry_price": price,
+                                "stop_price": open_pos["stop"],
+                                "pending": {
+                                    "side": open_pos["side"],
+                                    "meta": open_pos,
+                                    "risk_frac": self.risk_pct / 100,
+                                },
+                                "fill_kind": "pyramid",
+                            }
+                        ),
+                        "resolved pyramid size",
+                    ),
+                    self.qty_step,
+                )
             if be and touched and qty >= self.min_qty:
                 fill = apply_fill(
                     price,
@@ -956,13 +1005,13 @@ class BarSystemRunner:
             ) or local
             self.open = None
 
-    def step(
+    def _pre_signal(
         self,
         *,
         signal_equity: float | None = None,
         can_trade: bool = True,
         resolve_entry_size: Callable[[dict[str, object]], object] | None = None,
-    ) -> dict[str, object] | None:
+    ) -> dict[str, object] | _SignalPreparation | None:
         if not isinstance(can_trade, bool):
             raise ValidationError("can_trade must be boolean", context={"can_trade": can_trade})
         if signal_equity is not None:
@@ -1007,7 +1056,7 @@ class BarSystemRunner:
         if self.open and self.flatten_at_close and is_eod_bar(float(bar["time"])):
             self._force_exit("EOD", bar)
         if self.open:
-            self._manage_open(bar)
+            self._manage_open(bar, resolve_entry_size)
         # Intentional standalone JS behavior: zero means 0-dollar limit and blocks entry.
         daily_loss_hit = self.day_pnl <= -abs(self.max_daily_loss_pct / 100 * self.day_equity_start)
         trade_cap = self.daily_max_trades > 0 and self.day_trades >= self.daily_max_trades
@@ -1105,7 +1154,10 @@ class BarSystemRunner:
             "openPosition": self.open,
             "pendingOrder": self.pending,
         }
-        raw = call_signal_with_context(self.signal, context, self.index, bar, self.symbol)
+        return _SignalPreparation(bar, context, signal_equity, resolve_entry_size)
+
+    def _apply_raw_signal(self, raw: object, prepared: _SignalPreparation) -> dict[str, object]:
+        bar = prepared.bar
         next_signal = normalize_signal(raw, bar, self.final_tp_r)
         if next_signal:
             risk_frac = (
@@ -1143,13 +1195,59 @@ class BarSystemRunner:
                 bar,
                 float(self.pending["entry"]),
                 "limit",
-                signal_equity,
-                resolve_entry_size,
+                prepared.signal_equity,
+                prepared.resolve_entry_size,
             ):
                 self.pending = None
         self._record_frame(bar)
         self.index += 1
         return bar
+
+    def step(
+        self,
+        *,
+        signal_equity: float | None = None,
+        can_trade: bool = True,
+        resolve_entry_size: Callable[[dict[str, object]], object] | None = None,
+    ) -> dict[str, object] | None:
+        prepared = self._pre_signal(
+            signal_equity=signal_equity,
+            can_trade=can_trade,
+            resolve_entry_size=resolve_entry_size,
+        )
+        if not isinstance(prepared, _SignalPreparation):
+            return prepared
+        raw = call_signal_with_context(
+            self.signal, prepared.context, self.index, prepared.bar, self.symbol
+        )
+        return self._apply_raw_signal(raw, prepared)
+
+    async def step_async(
+        self,
+        *,
+        signal_equity: float | None = None,
+        can_trade: bool = True,
+        resolve_entry_size: Callable[[dict[str, object]], object] | None = None,
+    ) -> dict[str, object] | None:
+        """Advance one bar, awaiting the signal only when the bar is eligible."""
+        prepared = self._pre_signal(
+            signal_equity=signal_equity,
+            can_trade=can_trade,
+            resolve_entry_size=resolve_entry_size,
+        )
+        if not isinstance(prepared, _SignalPreparation):
+            return prepared
+        raw = call_signal_with_context(
+            self.signal, prepared.context, self.index, prepared.bar, self.symbol
+        )
+        if isawaitable(raw):
+            try:
+                raw = await raw
+            except Exception as error:
+                _raise_contextual_signal_error(
+                    error, prepared.context, self.index, prepared.bar, self.symbol
+                )
+        return self._apply_raw_signal(raw, prepared)
 
     def build_result(self) -> BacktestResult:
         metrics = build_metrics(

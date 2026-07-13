@@ -110,10 +110,9 @@ def test_apply_fill_falls_back_to_kind_multiplier_for_invalid_override(
     assert fill["price"] == pytest.approx(100.01)
 
 
-def test_day_key_et_matches_javascript_utc_anchor_at_et_midnight_crossing() -> None:
-    # The immutable oracle combines the UTC calendar date with the ET wall clock.
-    # At 02:00 UTC the real New York date is the prior day, but the oracle key is not.
-    assert day_key_et(1_704_161_600_000) == "2024-01-02"
+def test_day_key_et_uses_actual_new_york_midnight() -> None:
+    assert day_key_et(1_704_161_600_000) == "2024-01-01"  # 2024-01-02 02:00Z
+    assert day_key_et(1_704_172_400_000) == "2024-01-02"  # 2024-01-02 05:00Z
 
 
 @pytest.mark.parametrize(
