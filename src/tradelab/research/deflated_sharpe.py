@@ -1,0 +1,60 @@
+"""Deflated-Sharpe calculations for multiple strategy trials."""
+
+from __future__ import annotations
+
+import math
+from typing import TypedDict
+
+from tradelab.errors import ValidationError
+from tradelab.research.stats import normal_cdf, normal_ppf
+
+_EULER_MASCHERONI = 0.5772156649015329
+Number = int | float
+
+
+class SweepHaircut(TypedDict):
+    """Expected null maximum Sharpe across a sweep of trials."""
+
+    expected_max_sharpe: float
+    num_trials: int
+
+
+def _finite(value: Number, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValidationError(f"{name} must be a finite number", context={name: value})
+    return float(value)
+
+
+def sweep_haircut(*, num_trials: Number, sharpe_std: Number) -> SweepHaircut:
+    """Return the expected maximum null Sharpe from independent trials."""
+    trials_value = _finite(num_trials, name="num_trials")
+    standard_deviation = _finite(sharpe_std, name="sharpe_std")
+    trials = max(1, math.floor(trials_value))
+    a = normal_ppf(1 - 1 / trials)
+    b = normal_ppf(1 - 1 / (trials * math.e))
+    expected = standard_deviation * ((1 - _EULER_MASCHERONI) * a + _EULER_MASCHERONI * b)
+    return {"expected_max_sharpe": expected, "num_trials": trials}
+
+
+def deflated_sharpe(
+    *,
+    sharpe: Number,
+    sample_size: Number,
+    num_trials: Number = 1,
+    sharpe_std: Number = 0,
+    skew: Number = 0,
+    kurtosis: Number = 3,
+) -> float:
+    """Return the deflated Sharpe probability adjusted for trial selection."""
+    observed_sharpe = _finite(sharpe, name="sharpe")
+    size = _finite(sample_size, name="sample_size")
+    skewness = _finite(skew, name="skew")
+    kurt = _finite(kurtosis, name="kurtosis")
+    if size <= 0:
+        raise ValidationError("sample_size must be positive", context={"sample_size": sample_size})
+    null_sharpe = sweep_haircut(num_trials=num_trials, sharpe_std=sharpe_std)["expected_max_sharpe"]
+    denominator = math.sqrt(
+        max(1e-12, 1 - skewness * observed_sharpe + ((kurt - 1) / 4) * observed_sharpe**2)
+    )
+    z_score = ((observed_sharpe - null_sharpe) * math.sqrt(max(1, size - 1))) / denominator
+    return normal_cdf(z_score)
