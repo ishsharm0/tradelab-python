@@ -56,8 +56,10 @@ def _sortino(values: Sequence[float]) -> float:
     losses = [value for value in values if value < 0]
     downside_deviation = _stddev(losses if losses else [0.0])
     average = _mean(values)
-    return math.inf if downside_deviation == 0 and average > 0 else (
-        0.0 if downside_deviation == 0 else average / downside_deviation
+    return (
+        math.inf
+        if downside_deviation == 0 and average > 0
+        else (0.0 if downside_deviation == 0 else average / downside_deviation)
     )
 
 
@@ -253,8 +255,10 @@ def build_metrics(
             equity_series.append({"time": exit_time, "equity": reconstructed_equity})
     daily_returns = _daily_returns(equity_series)
     daily_std = _stddev(daily_returns)
-    sharpe_daily = math.inf if daily_std == 0 and daily_returns else (
-        0.0 if daily_std == 0 else _mean(daily_returns) / daily_std
+    sharpe_daily = (
+        math.inf
+        if daily_std == 0 and daily_returns
+        else (0.0 if daily_std == 0 else _mean(daily_returns) / daily_std)
     )
     sortino_daily = _sortino(daily_returns)
     periods = periods_per_year(interval, bar_ms)
@@ -262,12 +266,16 @@ def build_metrics(
     profit_factor_positions = _profit_factor(gross_profit_positions, gross_loss_positions)
     profit_factor_legs = _profit_factor(gross_profit_legs, gross_loss_legs)
     return_pct = (final_equity - start_equity) / max(1e-12, start_equity)
-    calmar = math.inf if max_drawdown == 0 and return_pct > 0 else (
-        0.0 if max_drawdown == 0 else return_pct / max_drawdown
+    calmar = (
+        math.inf
+        if max_drawdown == 0 and return_pct > 0
+        else (0.0 if max_drawdown == 0 else return_pct / max_drawdown)
     )
     trade_return_std = _stddev(trade_returns)
-    sharpe_per_trade = math.inf if trade_return_std == 0 and trade_returns else (
-        0.0 if trade_return_std == 0 else _mean(trade_returns) / trade_return_std
+    sharpe_per_trade = (
+        math.inf
+        if trade_return_std == 0 and trade_returns
+        else (0.0 if trade_return_std == 0 else _mean(trade_returns) / trade_return_std)
     )
     daily_win_rate = (
         len([value for value in daily_returns if value > 0]) / len(daily_returns)
@@ -331,8 +339,7 @@ def build_metrics(
             key: _json_number(_percentile(trade_rs, rank)) for key, rank in _PERCENTILE_RANKS
         },
         "hold_dist_min": {
-            key: _json_number(_percentile(hold_minutes, rank))
-            for key, rank in _PERCENTILE_RANKS
+            key: _json_number(_percentile(hold_minutes, rank)) for key, rank in _PERCENTILE_RANKS
         },
         "daily": {
             "count": len(daily_returns),

@@ -48,9 +48,7 @@ def test_moments_rejects_empty_or_nonfinite_values(values: list[float]) -> None:
     ],
     ids=["normal-cdf", "normal-ppf", "moments"],
 )
-def test_statistics_wrap_binary64_conversion_overflow(
-    function: object, value: object
-) -> None:
+def test_statistics_wrap_binary64_conversion_overflow(function: object, value: object) -> None:
     with pytest.raises(ValidationError):
         function(value)  # type: ignore[operator]
 

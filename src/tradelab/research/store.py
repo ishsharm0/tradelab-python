@@ -161,9 +161,9 @@ class _InterprocessRecordLock:
                     context={"lock_path": str(self.path), "error": str(error)},
                 ) from error
             try:
-                metadata = json.dumps(
-                    {"pid": os.getpid(), "created_at": time.time()}
-                ).encode("utf-8")
+                metadata = json.dumps({"pid": os.getpid(), "created_at": time.time()}).encode(
+                    "utf-8"
+                )
                 os.write(descriptor, metadata)
             except OSError as error:
                 with suppress(OSError):
