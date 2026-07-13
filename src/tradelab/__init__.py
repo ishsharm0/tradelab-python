@@ -1,5 +1,6 @@
 """TradeLab's public Python API."""
 
+from .engine import BarSystemRunner, backtest, financing_cost, funding_events
 from .errors import (
     BrokerError,
     DataProviderError,
@@ -12,6 +13,7 @@ from .errors import (
 from .models import Candle, Signal, to_primitive
 
 __all__ = [
+    "BarSystemRunner",
     "BrokerError",
     "Candle",
     "DataProviderError",
@@ -21,5 +23,8 @@ __all__ = [
     "StrategyError",
     "TradeLabError",
     "ValidationError",
+    "backtest",
+    "financing_cost",
+    "funding_events",
     "to_primitive",
 ]
