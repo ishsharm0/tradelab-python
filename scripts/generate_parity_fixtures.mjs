@@ -211,7 +211,27 @@ const portfolioResult = portfolio.backtestPortfolio({
 
 await mkdir(FIXTURE_DIR, { recursive: true });
 await writeFixture(fixtures.ta, {
-  input: { candles, closes },
+  input: {
+    candles,
+    closes,
+    calls: {
+      ema: { period: 5 },
+      atr: { period: 5 },
+      rsi: { period: 5 },
+      macd: { fast: 4, slow: 8, signalPeriod: 3 },
+      stochastic: { kPeriod: 5, dPeriod: 3 },
+      bollinger: { period: 5, mult: 2 },
+      donchian: { period: 5 },
+      keltner: { emaPeriod: 5, atrPeriod: 5, mult: 2 },
+      supertrend: { period: 5, mult: 2 },
+      vwap: {},
+      swingHighAt9: { index: 9, left: 2, right: 2 },
+      swingLowAt8: { index: 8, left: 2, right: 2 },
+      fvgAt3: { index: 3 },
+      lastSwingAt12: { index: 12, direction: "down" },
+      structureAt12: { index: 12 },
+    },
+  },
   output: {
     ema: ta.ema(closes, 5),
     atr: ta.atr(candles, 5),
@@ -231,7 +251,30 @@ await writeFixture(fixtures.ta, {
   },
 });
 await writeFixture(fixtures.metrics, {
-  input: { closed: tradeClosed, candles: candles.slice(0, 4), equityStart: 10_000, equityFinal: 10_020 },
+  input: {
+    finite: {
+      calls: [
+        { value: "Infinity", fallback: 0 },
+        { value: "-Infinity", fallback: 0 },
+        { value: "NaN", fallback: 7 },
+      ],
+    },
+    annualize: {
+      calls: [
+        { interval: "1d", estBarMs: null },
+        { interval: "1m", estBarMs: null },
+        { interval: "custom", estBarMs: HOUR },
+      ],
+    },
+    buildMetrics: {
+      closed: tradeClosed,
+      equityStart: 10_000,
+      equityFinal: 10_020,
+      candles: candles.slice(0, 4),
+      estBarMs: HOUR,
+      interval: "1h",
+    },
+  },
   output: {
     bigNumber: finite.BIG_NUMBER,
     clampFinite: [finite.clampFinite(Infinity), finite.clampFinite(-Infinity), finite.clampFinite(NaN, 7)],
@@ -251,7 +294,33 @@ await writeFixture(fixtures.metrics, {
   },
 });
 await writeFixture(fixtures.research, {
-  input: { seed: SEED, tradePnls: [10, -5, 7, -3, 4, 6] },
+  input: {
+    stats: { normalCdf: 1.25, normalPpf: 0.9, moments: [1, 2, 4, 8, 16] },
+    monteCarlo: {
+      tradePnls: [10, -5, 7, -3, 4, 6],
+      equityStart: 1_000,
+      iterations: 32,
+      blockSize: 2,
+      seed: SEED,
+    },
+    deflatedSharpe: {
+      sharpe: 1.4,
+      sampleSize: 64,
+      numTrials: 12,
+      sharpeStd: 0.3,
+      skew: -0.2,
+      kurtosis: 3.4,
+    },
+    pbo: {
+      performanceMatrix: [
+        [0.1, 0.2, -0.1, 0.3, 0.05, 0.2],
+        [0.15, -0.1, 0.2, 0.1, 0.12, -0.05],
+        [-0.05, 0.1, 0.05, -0.1, 0.2, 0.1],
+      ],
+      groups: 4,
+    },
+    cpcv: { nObservations: 12, nGroups: 4, nTestGroups: 2, embargo: 1 },
+  },
   output: {
     stats: { normalCdf: research.normalCdf(1.25), normalPpf: research.normalPpf(0.9), moments: research.moments([1, 2, 4, 8, 16]) },
     monteCarlo: research.monteCarlo({ tradePnls: [10, -5, 7, -3, 4, 6], equityStart: 1_000, iterations: 32, blockSize: 2, seed: SEED }),
@@ -260,18 +329,142 @@ await writeFixture(fixtures.research, {
     cpcv: research.combinatorialPurgedSplits({ nObservations: 12, nGroups: 4, nTestGroups: 2, embargo: 1 }),
   },
 });
-await writeFixture(fixtures.backtest, { input: { candles: barScenario.candles, scenario: "single-long-take-profit" }, output: barResult });
-await writeFixture(fixtures.ticks, { input: { ticks, seed: SEED, scenario: "single-long-limit-take-profit" }, output: tickResult });
+await writeFixture(fixtures.backtest, {
+  input: {
+    options: {
+      candles: barScenario.candles,
+      equity: 10_000,
+      warmupBars: 1,
+      flattenAtClose: false,
+      slippageBps: 0,
+      feeBps: 0,
+      scaleOutAtR: 0,
+      finalTP_R: 2,
+    },
+    signal: {
+      kind: "index-equals",
+      index: 1,
+      value: { side: "long", entry: 102, stop: 100, takeProfit: 104, qty: 2 },
+    },
+  },
+  output: barResult,
+});
+await writeFixture(fixtures.ticks, {
+  input: {
+    options: {
+      ticks,
+      symbol: "TICK",
+      equity: 10_000,
+      slippageBps: 0,
+      feeBps: 0,
+      seed: SEED,
+      queueFillProbability: 1,
+    },
+    signal: {
+      kind: "index-equals",
+      index: 0,
+      value: { side: "long", entry: 100.5, stop: 99, takeProfit: 102.5, qty: 3 },
+    },
+  },
+  output: tickResult,
+});
 await writeFixture(fixtures.financing, {
-  input: { fromMs: BASE_TIME, toMs: BASE_TIME + 25 * HOUR, notional: 10_000 },
+  input: {
+    fundingEvents: { fromMs: BASE_TIME, toMs: BASE_TIME + 25 * HOUR, intervalMs: 8 * HOUR, anchorMs: 0 },
+    long: {
+      side: "long",
+      notional: 10_000,
+      fromMs: BASE_TIME,
+      toMs: BASE_TIME + 25 * HOUR,
+      costs: {
+        carry: { longAnnualBps: 365, shortAnnualBps: 120 },
+        funding: { intervalMs: 8 * HOUR, rateBps: 1.5, anchorMs: 0 },
+      },
+    },
+    short: {
+      side: "short",
+      notional: 10_000,
+      fromMs: BASE_TIME,
+      toMs: BASE_TIME + 25 * HOUR,
+      costs: {
+        carry: { longAnnualBps: 365, shortAnnualBps: 120 },
+        funding: { intervalMs: 8 * HOUR, rateBps: 1.5, anchorMs: 0 },
+      },
+    },
+  },
   output: {
     fundingEvents: execution.fundingEvents(BASE_TIME, BASE_TIME + 25 * HOUR, 8 * HOUR, 0),
     long: execution.financingCost({ side: "long", notional: 10_000, fromMs: BASE_TIME, toMs: BASE_TIME + 25 * HOUR, costs: { carry: { longAnnualBps: 365, shortAnnualBps: 120 }, funding: { intervalMs: 8 * HOUR, rateBps: 1.5, anchorMs: 0 } } }),
     short: execution.financingCost({ side: "short", notional: 10_000, fromMs: BASE_TIME, toMs: BASE_TIME + 25 * HOUR, costs: { carry: { longAnnualBps: 365, shortAnnualBps: 120 }, funding: { intervalMs: 8 * HOUR, rateBps: 1.5, anchorMs: 0 } } }),
   },
 });
-await writeFixture(fixtures.walkForward, { input: { candles: walkForwardCandles, seed: SEED, scenario: "rolling-parameter-selection" }, output: walkForwardResult });
-await writeFixture(fixtures.portfolio, { input: { seed: SEED, scenario: "two-system-shared-capital" }, output: portfolioResult });
+await writeFixture(fixtures.walkForward, {
+  input: {
+    options: {
+      candles: walkForwardCandles,
+      parameterSets: [{ target: 1 }, { target: 2 }],
+      trainBars: 6,
+      testBars: 4,
+      stepBars: 4,
+      scoreBy: "totalPnL",
+      backtestOptions: {
+        equity: 10_000,
+        warmupBars: 1,
+        flattenAtClose: false,
+        slippageBps: 0,
+        feeBps: 0,
+        scaleOutAtR: 0,
+      },
+    },
+    signalFactory: {
+      kind: "index-equals-from-bar",
+      index: 1,
+      value: { side: "long", entry: "bar.close", stop: "bar.close - 1", takeProfit: "bar.close + params.target", qty: 1 },
+    },
+  },
+  output: walkForwardResult,
+});
+await writeFixture(fixtures.portfolio, {
+  input: {
+    options: {
+      equity: 10_000,
+      collectReplay: true,
+      processingOrder: "shuffle",
+      shuffleSeed: SEED,
+      systems: [
+        {
+          symbol: "ALPHA",
+          candles: candles.slice(0, 7),
+          warmupBars: 1,
+          flattenAtClose: false,
+          slippageBps: 0,
+          feeBps: 0,
+          scaleOutAtR: 0,
+          signal: {
+            kind: "index-equals",
+            index: 1,
+            value: { side: "long", entry: 102, stop: 100, takeProfit: 104, qty: 2 },
+          },
+        },
+        {
+          symbol: "BETA",
+          candles: candles.slice(0, 7).map((bar) => ({ ...bar, close: bar.close + 10, high: bar.high + 10, low: bar.low + 10, open: bar.open + 10 })),
+          warmupBars: 1,
+          flattenAtClose: false,
+          slippageBps: 0,
+          feeBps: 0,
+          scaleOutAtR: 0,
+          signal: {
+            kind: "index-equals",
+            index: 1,
+            value: { side: "short", entry: 113, stop: 115, takeProfit: 111, qty: 2 },
+          },
+        },
+      ],
+    },
+  },
+  output: portfolioResult,
+});
 
 const packageJson = JSON.parse(await readFile(resolve(JS_ROOT, "package.json"), "utf8"));
 await writeFixture("manifest.json", {
