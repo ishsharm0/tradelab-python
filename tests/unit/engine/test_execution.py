@@ -14,6 +14,7 @@ from tradelab.engine.execution import (
     round_step,
     touched_limit,
 )
+from tradelab.errors import ValidationError
 
 
 def test_apply_fill_composes_kind_slippage_spread_and_commissions() -> None:
@@ -93,3 +94,52 @@ def test_execution_supports_per_kind_costs_and_day_keys() -> None:
     assert fill["price"] == pytest.approx(100.1)
     assert day_key_utc(1_704_205_800_000) == "2024-01-02"
     assert day_key_et(1_704_205_800_000) == "2024-01-02"
+
+
+@pytest.mark.parametrize("slippage_by_kind", [{}, {"limit": "invalid"}])
+def test_apply_fill_falls_back_to_kind_multiplier_for_invalid_override(
+    slippage_by_kind: dict[str, object],
+) -> None:
+    fill = apply_fill(
+        100,
+        "long",
+        kind="limit",
+        costs={"slippageBps": 4, "slippageByKind": slippage_by_kind},
+    )
+
+    assert fill["price"] == pytest.approx(100.01)
+
+
+def test_day_key_et_matches_javascript_utc_anchor_at_et_midnight_crossing() -> None:
+    # The immutable oracle combines the UTC calendar date with the ET wall clock.
+    # At 02:00 UTC the real New York date is the prior day, but the oracle key is not.
+    assert day_key_et(1_704_161_600_000) == "2024-01-02"
+
+
+@pytest.mark.parametrize(
+    ("operation", "match"),
+    [
+        (lambda: apply_fill(10**10_000, "long"), "price"),
+        (lambda: apply_fill(100, "invalid"), "side"),
+        (lambda: apply_fill(100, "long", slippage_bps=float("nan")), "slippage_bps"),
+        (lambda: apply_fill(1e308, "long", slippage_bps=1e308), "finite"),
+        (lambda: clamp_stop(100, 99, "invalid", {}), "side"),
+        (lambda: touched_limit("invalid", 100, {"low": 99, "high": 101}), "side"),
+        (
+            lambda: oco_exit_check(
+                side="invalid",
+                stop=99,
+                tp=101,
+                bar={"high": 101, "low": 99, "close": 100},
+            ),
+            "side",
+        ),
+        (lambda: round_step(1, 0), "step"),
+        (lambda: round_step(1e308, 1e-308), "step quotient"),
+        (lambda: round_step(float("nan")), "value"),
+        (lambda: estimate_bar_ms([{"time": 0}, {"time": 10**10_000}]), "time"),
+    ],
+)
+def test_execution_boundaries_raise_validation_error(operation: object, match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        operation()  # type: ignore[operator]

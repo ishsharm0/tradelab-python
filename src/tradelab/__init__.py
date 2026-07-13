@@ -10,9 +10,10 @@ from .errors import (
     TradeLabError,
     ValidationError,
 )
-from .models import Candle, Signal, to_primitive
+from .models import BacktestResult, Candle, Signal, to_primitive
 
 __all__ = [
+    "BacktestResult",
     "BarSystemRunner",
     "BrokerError",
     "Candle",

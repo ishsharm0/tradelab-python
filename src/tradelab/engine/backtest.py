@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any, overload
 
 from tradelab.errors import ValidationError
 from tradelab.metrics import build_metrics
-from tradelab.models import Candle
+from tradelab.models import BacktestResult, Candle
 from tradelab.utils.indicators import atr
 from tradelab.utils.position_sizing import calculate_position_size
 
@@ -55,8 +56,14 @@ def _js_key(value: object) -> object:
     return value
 
 
+_SPECIAL_OPTION_KEYS = {"final_tp_r": "finalTP_R"}
+
+
 def _option(options: Mapping[str, Any], snake: str, default: Any) -> Any:
-    return options.get(snake, options.get(_camel(snake), default))
+    for key in (snake, _SPECIAL_OPTION_KEYS.get(snake), _camel(snake)):
+        if key is not None and key in options and options[key] is not None:
+            return options[key]
+    return default
 
 
 def _finite(value: object, name: str) -> float:
@@ -64,19 +71,72 @@ def _finite(value: object, name: str) -> float:
         raise ValidationError(f"{name} must be finite", context={name: value})
     try:
         result = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, OverflowError) as error:
         raise ValidationError(f"{name} must be finite", context={name: value}) from error
     if not math.isfinite(result):
         raise ValidationError(f"{name} must be finite", context={name: value})
     return result
 
 
+def _optional_finite(value: object) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _integer(value: object, name: str, *, minimum: int = 0) -> int:
+    numeric = _finite(value, name)
+    if not numeric.is_integer() or numeric < minimum:
+        raise ValidationError(f"{name} must be an integer >= {minimum}", context={name: value})
+    return int(numeric)
+
+
+def _bounded(
+    value: object,
+    name: str,
+    *,
+    minimum: float = 0,
+    maximum: float | None = None,
+    exclusive_minimum: bool = False,
+) -> float:
+    numeric = _finite(value, name)
+    below = numeric <= minimum if exclusive_minimum else numeric < minimum
+    if below or (maximum is not None and numeric > maximum):
+        suffix = f" and <= {maximum}" if maximum is not None else ""
+        operator = ">" if exclusive_minimum else ">="
+        raise ValidationError(f"{name} must be {operator} {minimum}{suffix}", context={name: value})
+    return numeric
+
+
 def _time(value: object) -> int:
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValidationError("candle time must be timezone-aware", context={"time": value})
+        return round(value.timestamp() * 1_000)
     if isinstance(value, bool):
         raise ValidationError("candle time must be Unix milliseconds", context={"time": value})
     try:
-        result = int(_finite(value, "time"))
+        if isinstance(value, str):
+            text = value.strip().strip("\"'")
+            try:
+                numeric = float(text)
+            except ValueError:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise ValidationError(
+                        "candle time must include a timezone", context={"time": value}
+                    ) from None
+                return round(parsed.timestamp() * 1_000)
+        else:
+            numeric = _finite(value, "time")
+        result = int(numeric * 1_000 if numeric < 1e11 else numeric)
         datetime.fromtimestamp(result / 1_000, UTC)
+    except ValidationError:
+        raise
     except (TypeError, ValueError, OverflowError, OSError) as error:
         raise ValidationError(
             "candle time must be Unix milliseconds", context={"time": value}
@@ -84,22 +144,36 @@ def _time(value: object) -> int:
     return result
 
 
+def _first_present(value: Mapping[str, object], *keys: str) -> object:
+    return next((value[key] for key in keys if key in value and value[key] is not None), None)
+
+
 def _normalize_candle(value: object, index: int) -> dict[str, Any]:
     if isinstance(value, Candle):
-        return dict(value.to_dict())
+        value = value.to_dict()
     if not isinstance(value, Mapping):
         raise ValidationError("candle must be a mapping", context={"index": index})
-    required = ("time", "open", "high", "low", "close")
-    if any(key not in value for key in required):
+    raw_time = _first_present(value, "time", "timestamp", "date")
+    raw_open = _first_present(value, "open", "o")
+    raw_high = _first_present(value, "high", "h")
+    raw_low = _first_present(value, "low", "l")
+    raw_close = _first_present(value, "close", "c")
+    if any(item is None for item in (raw_time, raw_open, raw_high, raw_low, raw_close)):
         raise ValidationError(
             "candle requires time, open, high, low, and close", context={"index": index}
         )
-    candle: dict[str, Any] = {"time": _time(value["time"])}
-    for key in required[1:]:
-        candle[key] = _finite(value[key], f"candle.{key}")
-    volume = value.get("volume")
-    if volume is not None:
-        candle["volume"] = _finite(volume, "candle.volume")
+    candle: dict[str, Any] = {
+        "time": _time(raw_time),
+        "open": _finite(raw_open, "candle.open"),
+        "high": _finite(raw_high, "candle.high"),
+        "low": _finite(raw_low, "candle.low"),
+        "close": _finite(raw_close, "candle.close"),
+    }
+    volume = _first_present(value, "volume", "v")
+    try:
+        candle["volume"] = _finite(0 if volume is None else volume, "candle.volume")
+    except ValidationError:
+        candle["volume"] = 0.0
     high, low = float(candle["high"]), float(candle["low"])
     if (
         high < low
@@ -113,7 +187,18 @@ def _normalize_candle(value: object, index: int) -> dict[str, Any]:
 def _normalize_candles(value: object) -> list[dict[str, Any]]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise ValidationError("candles must be a sequence")
-    candles = [_normalize_candle(bar, index) for index, bar in enumerate(value)]
+    candles = sorted(
+        (_normalize_candle(bar, index) for index, bar in enumerate(value)),
+        key=lambda candle: candle["time"],
+    )
+    deduped: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for candle in candles:
+        time = int(candle["time"])
+        if time not in seen:
+            seen.add(time)
+            deduped.append(candle)
+    candles = deduped
     if not candles:
         raise ValidationError("backtest requires non-empty candles")
     return candles
@@ -129,6 +214,10 @@ def _iso(time_ms: float) -> str:
 
 def _equity_point(time: float, equity: float) -> dict[str, float]:
     return {"time": time, "timestamp": time, "equity": equity}
+
+
+def _js_round_nonnegative(value: float) -> int:
+    return math.floor(value + 0.5)
 
 
 class _StrictHistory(Sequence[dict[str, Any]]):
@@ -173,48 +262,79 @@ class BarSystemRunner:
         self.range = _option(raw, "range", None)
         self.equity_start = _finite(_option(raw, "equity", 10_000), "equity")
         self.current_equity = self.equity_start
-        self.risk_pct = _finite(
-            _option(
-                raw, "risk_pct", _option(raw, "riskFraction", 0.01) if "riskFraction" in raw else 1
-            ),
-            "risk_pct",
-        )
-        if "riskFraction" in raw or "risk_fraction" in raw:
-            self.risk_pct = (
-                _finite(
-                    _option(raw, "risk_fraction", _option(raw, "riskFraction", 0.01)),
-                    "risk_fraction",
-                )
-                * 100
-            )
-        self.warmup_bars = int(_option(raw, "warmup_bars", 200))
+        risk_fraction = _optional_finite(_option(raw, "risk_fraction", None))
+        if risk_fraction is not None:
+            self.risk_pct = risk_fraction * 100
+        else:
+            self.risk_pct = _finite(_option(raw, "risk_pct", 1), "risk_pct")
+        self.warmup_bars = _integer(_option(raw, "warmup_bars", 200), "warmup_bars")
         self.slippage_bps = _finite(_option(raw, "slippage_bps", 1), "slippage_bps")
         self.fee_bps = _finite(_option(raw, "fee_bps", 0), "fee_bps")
         costs = _option(raw, "costs", None)
-        self.costs: Mapping[str, object] | None = costs if isinstance(costs, Mapping) else None
-        self.scale_out_at_r = _finite(_option(raw, "scale_out_at_r", 1), "scale_out_at_r")
-        self.scale_out_frac = _finite(_option(raw, "scale_out_frac", 0.5), "scale_out_frac")
-        self.final_tp_r = _finite(_option(raw, "final_tp_r", 3), "final_tp_r")
-        self.max_daily_loss_pct = _finite(
+        if costs is not None and not isinstance(costs, Mapping):
+            raise ValidationError("costs must be a mapping", context={"costs": costs})
+        self.costs: Mapping[str, object] | None = (
+            deepcopy(dict(costs)) if isinstance(costs, Mapping) else None
+        )
+        self.scale_out_at_r = _bounded(_option(raw, "scale_out_at_r", 1), "scale_out_at_r")
+        self.scale_out_frac = _bounded(
+            _option(raw, "scale_out_frac", 0.5), "scale_out_frac", maximum=1
+        )
+        self.final_tp_r = _bounded(_option(raw, "final_tp_r", 3), "final_tp_r")
+        self.max_daily_loss_pct = _bounded(
             _option(raw, "max_daily_loss_pct", 2), "max_daily_loss_pct"
         )
-        self.atr_trail_mult = _finite(_option(raw, "atr_trail_mult", 0), "atr_trail_mult")
-        self.atr_trail_period = int(_option(raw, "atr_trail_period", 14))
+        self.atr_trail_mult = _bounded(_option(raw, "atr_trail_mult", 0), "atr_trail_mult")
+        self.atr_trail_period = _integer(
+            _option(raw, "atr_trail_period", 14), "atr_trail_period", minimum=1
+        )
         self.oco: dict[str, Any] = {
             "mode": "intrabar",
             "tieBreak": "pessimistic",
             "clampStops": True,
             "clampEpsBps": 0.25,
         }
-        if isinstance(_option(raw, "oco", None), Mapping):
-            self.oco.update(_option(raw, "oco", None))
+        raw_oco = _option(raw, "oco", None)
+        if raw_oco is not None and not isinstance(raw_oco, Mapping):
+            raise ValidationError("oco must be a mapping", context={"oco": raw_oco})
+        if isinstance(raw_oco, Mapping):
+            self.oco.update(
+                {
+                    "mode": _option(raw_oco, "mode", self.oco["mode"]),
+                    "tieBreak": _option(raw_oco, "tie_break", self.oco["tieBreak"]),
+                    "clampStops": bool(_option(raw_oco, "clamp_stops", self.oco["clampStops"])),
+                    "clampEpsBps": _bounded(
+                        _option(raw_oco, "clamp_eps_bps", self.oco["clampEpsBps"]),
+                        "oco.clamp_eps_bps",
+                    ),
+                }
+            )
+        if self.oco["mode"] not in {"intrabar", "close"}:
+            raise ValidationError("oco.mode must be intrabar or close")
+        if self.oco["tieBreak"] not in {"pessimistic", "optimistic"}:
+            raise ValidationError("oco.tie_break must be pessimistic or optimistic")
         self.trigger = str(_option(raw, "trigger_mode", self.oco["mode"]))
+        if self.trigger not in {"intrabar", "close"}:
+            raise ValidationError("trigger_mode must be intrabar or close")
         self.flatten_at_close = bool(_option(raw, "flatten_at_close", True))
-        self.daily_max_trades = int(_option(raw, "daily_max_trades", 0))
-        self.post_loss_cooldown_bars = int(_option(raw, "post_loss_cooldown_bars", 0))
+        self.daily_max_trades = _integer(_option(raw, "daily_max_trades", 0), "daily_max_trades")
+        self.post_loss_cooldown_bars = _integer(
+            _option(raw, "post_loss_cooldown_bars", 0), "post_loss_cooldown_bars"
+        )
         self.mfe_trail: dict[str, Any] = {"enabled": False, "armR": 1, "givebackR": 0.5}
-        if isinstance(_option(raw, "mfe_trail", None), Mapping):
-            self.mfe_trail.update(_option(raw, "mfe_trail", None))
+        raw_mfe = _option(raw, "mfe_trail", None)
+        if raw_mfe is not None and not isinstance(raw_mfe, Mapping):
+            raise ValidationError("mfe_trail must be a mapping")
+        if isinstance(raw_mfe, Mapping):
+            self.mfe_trail.update(
+                {
+                    "enabled": bool(_option(raw_mfe, "enabled", False)),
+                    "armR": _bounded(_option(raw_mfe, "arm_r", 1), "mfe_trail.arm_r"),
+                    "givebackR": _bounded(
+                        _option(raw_mfe, "giveback_r", 0.5), "mfe_trail.giveback_r"
+                    ),
+                }
+            )
         self.pyramiding: dict[str, Any] = {
             "enabled": False,
             "addAtR": 1,
@@ -222,8 +342,29 @@ class BarSystemRunner:
             "maxAdds": 1,
             "onlyAfterBreakEven": True,
         }
-        if isinstance(_option(raw, "pyramiding", None), Mapping):
-            self.pyramiding.update(_option(raw, "pyramiding", None))
+        raw_pyramiding = _option(raw, "pyramiding", None)
+        if raw_pyramiding is not None and not isinstance(raw_pyramiding, Mapping):
+            raise ValidationError("pyramiding must be a mapping")
+        if isinstance(raw_pyramiding, Mapping):
+            self.pyramiding.update(
+                {
+                    "enabled": bool(_option(raw_pyramiding, "enabled", False)),
+                    "addAtR": _bounded(
+                        _option(raw_pyramiding, "add_at_r", 1), "pyramiding.add_at_r"
+                    ),
+                    "addFrac": _bounded(
+                        _option(raw_pyramiding, "add_frac", 0.25),
+                        "pyramiding.add_frac",
+                        maximum=1,
+                    ),
+                    "maxAdds": _integer(
+                        _option(raw_pyramiding, "max_adds", 1), "pyramiding.max_adds"
+                    ),
+                    "onlyAfterBreakEven": bool(
+                        _option(raw_pyramiding, "only_after_break_even", True)
+                    ),
+                }
+            )
         self.vol_scale: dict[str, Any] = {
             "enabled": False,
             "atrPeriod": self.atr_trail_period,
@@ -231,21 +372,63 @@ class BarSystemRunner:
             "cutFrac": 0.33,
             "noCutAboveR": 1.5,
         }
-        if isinstance(_option(raw, "vol_scale", None), Mapping):
-            self.vol_scale.update(_option(raw, "vol_scale", None))
-        self.qty_step = _finite(_option(raw, "qty_step", 0.001), "qty_step")
-        self.min_qty = _finite(_option(raw, "min_qty", 0.001), "min_qty")
-        self.max_leverage = _finite(_option(raw, "max_leverage", 2), "max_leverage")
+        raw_vol_scale = _option(raw, "vol_scale", None)
+        if raw_vol_scale is not None and not isinstance(raw_vol_scale, Mapping):
+            raise ValidationError("vol_scale must be a mapping")
+        if isinstance(raw_vol_scale, Mapping):
+            self.vol_scale.update(
+                {
+                    "enabled": bool(_option(raw_vol_scale, "enabled", False)),
+                    "atrPeriod": _integer(
+                        _option(raw_vol_scale, "atr_period", self.atr_trail_period),
+                        "vol_scale.atr_period",
+                        minimum=1,
+                    ),
+                    "cutIfAtrX": _bounded(
+                        _option(raw_vol_scale, "cut_if_atr_x", 1.3),
+                        "vol_scale.cut_if_atr_x",
+                    ),
+                    "cutFrac": _bounded(
+                        _option(raw_vol_scale, "cut_frac", 0.33),
+                        "vol_scale.cut_frac",
+                        maximum=1,
+                    ),
+                    "noCutAboveR": _bounded(
+                        _option(raw_vol_scale, "no_cut_above_r", 1.5),
+                        "vol_scale.no_cut_above_r",
+                    ),
+                }
+            )
+        self.qty_step = _bounded(
+            _option(raw, "qty_step", 0.001), "qty_step", exclusive_minimum=True
+        )
+        self.min_qty = _bounded(_option(raw, "min_qty", 0.001), "min_qty")
+        self.max_leverage = _bounded(_option(raw, "max_leverage", 2), "max_leverage")
         self.entry_chase: dict[str, Any] = {
             "enabled": True,
             "afterBars": 2,
             "maxSlipR": 0.2,
             "convertOnExpiry": False,
         }
-        if isinstance(_option(raw, "entry_chase", None), Mapping):
-            self.entry_chase.update(_option(raw, "entry_chase", None))
+        raw_entry_chase = _option(raw, "entry_chase", None)
+        if raw_entry_chase is not None and not isinstance(raw_entry_chase, Mapping):
+            raise ValidationError("entry_chase must be a mapping")
+        if isinstance(raw_entry_chase, Mapping):
+            self.entry_chase.update(
+                {
+                    "enabled": bool(_option(raw_entry_chase, "enabled", True)),
+                    "afterBars": _integer(
+                        _option(raw_entry_chase, "after_bars", 2), "entry_chase.after_bars"
+                    ),
+                    "maxSlipR": _bounded(
+                        _option(raw_entry_chase, "max_slip_r", 0.2),
+                        "entry_chase.max_slip_r",
+                    ),
+                    "convertOnExpiry": bool(_option(raw_entry_chase, "convert_on_expiry", False)),
+                }
+            )
         self.reanchor_stop_on_fill = bool(_option(raw, "reanchor_stop_on_fill", True))
-        self.max_slip_r_on_fill = _finite(
+        self.max_slip_r_on_fill = _bounded(
             _option(raw, "max_slip_r_on_fill", 0.4), "max_slip_r_on_fill"
         )
         self.want_eq_series = bool(_option(raw, "collect_eq_series", True))
@@ -291,6 +474,16 @@ class BarSystemRunner:
 
     def peek_time(self) -> float:
         return float(self.candles[self.index]["time"]) if self.has_next() else math.inf
+
+    def get_locked_capital(self) -> float:
+        if not self.open:
+            return 0.0
+        leverage = max(1.0, self.max_leverage or 1.0)
+        return (
+            abs(float(self.open.get("entryFill", self.open["entry"])))
+            * max(0.0, float(self.open["size"]))
+            / leverage
+        )
 
     def get_mark_price(self) -> float | None:
         return float(self.last_bar["close"]) if self.last_bar else None
@@ -375,11 +568,13 @@ class BarSystemRunner:
         open_pos["size"] = remaining
         open_pos["_realized"] = float(open_pos.get("_realized", 0)) + pnl
 
-    def _force_exit(self, reason: str, bar: Mapping[str, Any]) -> None:
+    def _force_exit(
+        self, reason: str, bar: Mapping[str, Any], override_price: float | None = None
+    ) -> None:
         if not self.open:
             return
         fill = apply_fill(
-            float(bar["close"]),
+            float(bar["close"] if override_price is None else override_price),
             "short" if self.open["side"] == "long" else "long",
             slippage_bps=self.slippage_bps,
             fee_bps=self.fee_bps,
@@ -389,6 +584,19 @@ class BarSystemRunner:
         self._close_leg(float(self.open["size"]), fill["price"], fill["fee_total"], bar, reason)
         self.cooldown = int(self.open.get("_cooldownBars", 0))
         self.open = None
+
+    def force_exit(
+        self,
+        reason: str,
+        bar: Mapping[str, Any] | None = None,
+        override_price: float | None = None,
+    ) -> None:
+        target = bar or self.last_bar
+        if target is not None:
+            self._force_exit(reason, target, override_price)
+
+    def cancel_pending(self) -> None:
+        self.pending = None
 
     def _tighten_breakeven(self, bar: Mapping[str, Any]) -> None:
         assert self.open is not None
@@ -411,7 +619,14 @@ class BarSystemRunner:
             else candidate
         )
 
-    def _open_from_pending(self, bar: Mapping[str, Any], entry: float, kind: str) -> bool:
+    def _open_from_pending(
+        self,
+        bar: Mapping[str, Any],
+        entry: float,
+        kind: str,
+        signal_equity: float | None = None,
+        resolve_entry_size: Callable[[dict[str, object]], object] | None = None,
+    ) -> bool:
         if not self.pending:
             return False
         pending = self.pending
@@ -436,11 +651,11 @@ class BarSystemRunner:
                     else entry - rr * abs(entry - stop)
                 )
         requested = pending.get("fixedQty")
-        size = (
+        desired_size = (
             float(requested)
             if requested is not None
             else calculate_position_size(
-                equity=self.current_equity,
+                equity=self.current_equity if signal_equity is None else signal_equity,
                 entry=entry,
                 stop=stop,
                 risk_fraction=float(pending["riskFrac"]),
@@ -448,6 +663,23 @@ class BarSystemRunner:
                 min_qty=self.min_qty,
                 max_leverage=self.max_leverage,
             )
+        )
+        size = (
+            _finite(
+                resolve_entry_size(
+                    {
+                        "runner": self,
+                        "desired_size": desired_size,
+                        "entry_price": entry,
+                        "stop_price": stop,
+                        "pending": pending,
+                        "fill_kind": kind,
+                    }
+                ),
+                "resolved entry size",
+            )
+            if resolve_entry_size is not None
+            else desired_size
         )
         size = round_step(size, self.qty_step)
         if size < self.min_qty:
@@ -724,7 +956,19 @@ class BarSystemRunner:
             ) or local
             self.open = None
 
-    def step(self) -> dict[str, object] | None:
+    def step(
+        self,
+        *,
+        signal_equity: float | None = None,
+        can_trade: bool = True,
+        resolve_entry_size: Callable[[dict[str, object]], object] | None = None,
+    ) -> dict[str, object] | None:
+        if not isinstance(can_trade, bool):
+            raise ValidationError("can_trade must be boolean", context={"can_trade": can_trade})
+        if signal_equity is not None:
+            signal_equity = _finite(signal_equity, "signal_equity")
+        if resolve_entry_size is not None and not callable(resolve_entry_size):
+            raise ValidationError("resolve_entry_size must be callable")
         if not self.has_next():
             return None
         bar = self.candles[self.index]
@@ -745,7 +989,9 @@ class BarSystemRunner:
             and int(self.open.get("_maxBarsInTrade", 0)) > 0
             and max(
                 1,
-                round((float(bar["time"]) - float(self.open["openTime"])) / self.estimated_bar_ms),
+                _js_round_nonnegative(
+                    (float(bar["time"]) - float(self.open["openTime"])) / self.estimated_bar_ms
+                ),
             )
             >= int(self.open["_maxBarsInTrade"])
         ):
@@ -766,15 +1012,31 @@ class BarSystemRunner:
         daily_loss_hit = self.day_pnl <= -abs(self.max_daily_loss_pct / 100 * self.day_equity_start)
         trade_cap = self.daily_max_trades > 0 and self.day_trades >= self.daily_max_trades
         if not self.open and self.pending:
-            if self.index > int(self.pending["expiresAt"]) or daily_loss_hit or trade_cap:
+            if not can_trade:
+                self.pending = None
+            elif self.index > int(self.pending["expiresAt"]) or daily_loss_hit or trade_cap:
                 if self.entry_chase["enabled"] and self.entry_chase["convertOnExpiry"]:
-                    self._open_from_pending(bar, float(bar["close"]), "market")
+                    if not self._open_from_pending(
+                        bar,
+                        float(bar["close"]),
+                        "market",
+                        signal_equity,
+                        resolve_entry_size,
+                    ):
+                        self.pending = None
                 else:
                     self.pending = None
             elif touched_limit(
                 str(self.pending["side"]), float(self.pending["entry"]), bar, self.trigger
             ):
-                self._open_from_pending(bar, float(self.pending["entry"]), "limit")
+                if not self._open_from_pending(
+                    bar,
+                    float(self.pending["entry"]),
+                    "limit",
+                    signal_equity,
+                    resolve_entry_size,
+                ):
+                    self.pending = None
             elif self.entry_chase["enabled"]:
                 elapsed = self.index - int(self.pending.get("startedAtIndex", self.index))
                 meta = self.pending.get("meta")
@@ -805,17 +1067,24 @@ class BarSystemRunner:
                         * (float(bar["close"]) - float(self.pending["entry"]))
                         / max(1e-8, risk_ref),
                     )
-                    if slipped_r > self.max_slip_r_on_fill:
+                    if slipped_r > self.max_slip_r_on_fill or (
+                        0 < slipped_r <= float(self.entry_chase["maxSlipR"])
+                        and not self._open_from_pending(
+                            bar,
+                            float(bar["close"]),
+                            "market",
+                            signal_equity,
+                            resolve_entry_size,
+                        )
+                    ):
                         self.pending = None
-                    elif 0 < slipped_r <= float(self.entry_chase["maxSlipR"]):
-                        self._open_from_pending(bar, float(bar["close"]), "market")
         if self.open or self.cooldown > 0:
             if self.cooldown > 0:
                 self.cooldown -= 1
             self._record_frame(bar)
             self.index += 1
             return bar
-        if daily_loss_hit or trade_cap:
+        if not can_trade or daily_loss_hit or trade_cap:
             self.pending = None
             self._record_frame(bar)
             self.index += 1
@@ -832,7 +1101,7 @@ class BarSystemRunner:
             "candles": _StrictHistory(self.history, self.index) if self.strict else self.history,
             "index": self.index,
             "bar": bar,
-            "equity": self.current_equity,
+            "equity": self.current_equity if signal_equity is None else signal_equity,
             "openPosition": self.open,
             "pendingOrder": self.pending,
         }
@@ -870,13 +1139,19 @@ class BarSystemRunner:
             }
             if touched_limit(
                 str(self.pending["side"]), float(self.pending["entry"]), bar, self.trigger
+            ) and not self._open_from_pending(
+                bar,
+                float(self.pending["entry"]),
+                "limit",
+                signal_equity,
+                resolve_entry_size,
             ):
-                self._open_from_pending(bar, float(self.pending["entry"]), "limit")
+                self.pending = None
         self._record_frame(bar)
         self.index += 1
         return bar
 
-    def build_result(self) -> dict[str, Any]:
+    def build_result(self) -> BacktestResult:
         metrics = build_metrics(
             closed=self.closed,
             equity_start=self.equity_start,
@@ -909,20 +1184,22 @@ class BarSystemRunner:
                     "_initRisk": self.open["_initRisk"],
                 }
             ]
-        return {
-            "symbol": self.symbol,
-            "interval": self.interval,
-            "range": self.range,
-            "trades": self.closed,
-            "positions": [x for x in self.closed if x["exit"]["reason"] != "SCALE"],
-            "openPositions": open_positions,
-            "metrics": _js_key(metrics),
-            "eqSeries": self.eq_series,
-            "replay": {"frames": self.replay_frames, "events": self.replay_events},
-        }
+        return BacktestResult(
+            {
+                "symbol": self.symbol,
+                "interval": self.interval,
+                "range": self.range,
+                "trades": self.closed,
+                "positions": [x for x in self.closed if x["exit"]["reason"] != "SCALE"],
+                "openPositions": open_positions,
+                "metrics": _js_key(metrics),
+                "eqSeries": self.eq_series,
+                "replay": {"frames": self.replay_frames, "events": self.replay_events},
+            }
+        )
 
 
-def backtest(options: Mapping[str, object] | None = None, /, **kwargs: object) -> dict[str, Any]:
+def backtest(options: Mapping[str, object] | None = None, /, **kwargs: object) -> BacktestResult:
     """Exhaust :class:`BarSystemRunner` synchronously without terminal liquidation."""
     runner = BarSystemRunner(options, **kwargs)
     while runner.has_next():

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import assert_type
+from typing import Any, assert_type
 
-from tradelab.models import Candle, Signal, to_primitive
+import pytest
+
+from tradelab.errors import ValidationError
+from tradelab.models import BacktestResult, Candle, Signal, to_primitive
 
 
 def test_candle_accepts_unix_ms_and_serializes_stably() -> None:
@@ -65,3 +68,34 @@ def test_to_primitive_recursively_serializes_models() -> None:
             }
         ]
     }
+
+
+def test_backtest_result_is_a_defensive_mapping_snapshot() -> None:
+    source: dict[str, Any] = {
+        "symbol": "ES",
+        "trades": [{"id": 1}],
+        "replay": {"frames": [], "events": []},
+    }
+    result = BacktestResult(source)
+    source["trades"][0]["id"] = 99
+
+    first = result.to_dict()
+    assert first["trades"] == [{"id": 1}]
+    first["trades"][0]["id"] = 42
+    assert result["trades"] == [{"id": 1}]
+    assert list(result) == ["symbol", "trades", "replay"]
+
+
+def test_backtest_result_rejects_nonfinite_output() -> None:
+    with pytest.raises(ValidationError, match="finite JSON"):
+        BacktestResult({"metrics": {"bad": float("inf")}})
+
+
+def test_backtest_result_rejects_cycles_and_nonportable_integers() -> None:
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+
+    with pytest.raises(ValidationError, match="cyclic"):
+        BacktestResult(cyclic)
+    with pytest.raises(ValidationError, match="portable JSON"):
+        BacktestResult({"tooLarge": 10**10_000})

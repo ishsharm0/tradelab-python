@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tradelab.engine.financing import financing_cost, funding_events
+from tradelab.errors import ValidationError
 
 
 def test_funding_counts_from_exclusive_to_inclusive_boundaries() -> None:
@@ -27,3 +28,28 @@ def test_financing_fixture_long_and_short() -> None:
     assert financing_cost("short", 10_000, from_ms, to_ms, costs) == pytest.approx(
         -4.1575342465753415
     )
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda: funding_events(10**10_000, 1, 1),
+        lambda: funding_events(0, 1, float("nan")),
+        lambda: funding_events(0, 1, 1, float("inf")),
+        lambda: financing_cost("invalid", 100, 0, 1, {}),
+        lambda: financing_cost("long", 10**10_000, 0, 1, {}),
+        lambda: financing_cost("long", 100, 0, 1, "invalid"),  # type: ignore[arg-type]
+        lambda: financing_cost("long", 100, 0, 1, {"carry": {"longAnnualBps": float("inf")}}),
+        lambda: financing_cost(
+            "long",
+            100,
+            0,
+            1,
+            {"funding": {"intervalMs": 1, "rateBps": 1, "anchorMs": float("nan")}},
+        ),
+        lambda: financing_cost("long", 1e308, 0, 1, {"carry": {"longAnnualBps": 1e308}}),
+    ],
+)
+def test_financing_boundaries_raise_validation_error(operation: object) -> None:
+    with pytest.raises(ValidationError):
+        operation()  # type: ignore[operator]

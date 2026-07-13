@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import math
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeAlias
+from types import MappingProxyType
+from typing import Any, TypeAlias
 
 from .errors import ValidationError
 
 Primitive: TypeAlias = None | bool | int | float | str | list["Primitive"] | dict[str, "Primitive"]
+MAX_SAFE_INTEGER = 2**53 - 1
 
 
 def _utc_datetime(value: datetime | int) -> datetime:
@@ -95,6 +98,77 @@ class Signal:
     def normalized_side(self) -> str:
         """Return the canonical long or short form of the signal direction."""
         return self.side
+
+
+def _freeze_json(value: object, active: set[int] | None = None) -> object:
+    """Copy JSON data into immutable containers and reject invalid numerics."""
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        if abs(value) > MAX_SAFE_INTEGER:
+            raise ValidationError("BacktestResult integer exceeds portable JSON range")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValidationError("BacktestResult requires finite JSON numbers")
+        return value
+    if isinstance(value, Mapping):
+        seen = active if active is not None else set()
+        identity = id(value)
+        if identity in seen:
+            raise ValidationError("BacktestResult cannot contain cyclic JSON data")
+        seen.add(identity)
+        try:
+            return MappingProxyType(
+                {str(key): _freeze_json(item, seen) for key, item in value.items()}
+            )
+        finally:
+            seen.remove(identity)
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes, bytearray)):
+        seen = active if active is not None else set()
+        identity = id(value)
+        if identity in seen:
+            raise ValidationError("BacktestResult cannot contain cyclic JSON data")
+        seen.add(identity)
+        try:
+            return tuple(_freeze_json(item, seen) for item in value)
+        finally:
+            seen.remove(identity)
+    return _freeze_json(to_primitive(value), active)
+
+
+def _thaw_json(value: object) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class BacktestResult(Mapping[str, Any]):
+    """Immutable typed snapshot returned by every simulation engine."""
+
+    _data: Mapping[str, object]
+
+    def __init__(self, payload: Mapping[str, object]) -> None:
+        frozen = _freeze_json(payload)
+        if not isinstance(frozen, Mapping):  # pragma: no cover - guaranteed by input type
+            raise ValidationError("BacktestResult payload must be a mapping")
+        object.__setattr__(self, "_data", frozen)
+
+    def __getitem__(self, key: str) -> Any:
+        return _thaw_json(self._data[key])
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a fresh JSON-compatible dictionary."""
+        return {key: _thaw_json(value) for key, value in self._data.items()}
 
 
 def to_primitive(value: object) -> Primitive:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 import pytest
@@ -12,6 +12,8 @@ from tradelab.engine.financing import financing_cost, funding_events
 
 
 def _camel_to_snake(value: str) -> str:
+    if value == "finalTP_R":
+        return "final_tp_r"
     value = value.replace("PnL", "Pnl")
     return "".join((f"_{char.lower()}" if char.isupper() else char) for char in value)
 
@@ -23,7 +25,7 @@ def _signal(spec: dict[str, Any]) -> Callable[[dict[str, object]], dict[str, obj
 
 def _assert_approx(actual: Any, expected: Any) -> None:
     if isinstance(expected, dict):
-        assert isinstance(actual, dict)
+        assert isinstance(actual, Mapping)
         assert actual.keys() == expected.keys()
         for key, value in expected.items():
             _assert_approx(actual[key], value)
