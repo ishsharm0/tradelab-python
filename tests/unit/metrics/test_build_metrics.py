@@ -18,13 +18,13 @@ from tradelab.metrics import BIG_NUMBER, build_metrics
 
 def _leg(
     *,
-    time: int,
+    time: int | float,
     pnl: float,
     side: str = "long",
     entry: float = 100.0,
     entry_fill: float | None = 100.0,
     risk: float = 1.0,
-    open_time: int | None = None,
+    open_time: int | float | None = None,
     reason: str | None = None,
 ) -> dict[str, object]:
     exit_price = entry + pnl if side == "long" else entry - pnl
@@ -184,6 +184,31 @@ def test_daily_returns_honor_utc_order_equal_times_filtered_days_and_benchmark_l
     assert cast(Mapping[str, object], metrics["benchmark"])["beta"] is None
 
 
+def test_daily_bucketing_uses_ecmascript_timeclip_instead_of_python_datetime() -> None:
+    coalesced = _metrics(
+        [],
+        eq_series=[{"time": -0.5, "equity": 100.0}, {"time": 0.5, "equity": 110.0}],
+    )
+    assert coalesced["daily"] == {"count": 1, "win_rate": 1.0, "avg_return": 0.1}
+
+    year_10_000 = _metrics(
+        [],
+        eq_series=[
+            {"time": 253_402_300_800_000, "equity": 100.0},
+            {"time": 253_402_300_800_001, "equity": 101.0},
+        ],
+    )
+    assert year_10_000["daily"] == {"count": 1, "win_rate": 1.0, "avg_return": 0.01}
+
+
+@pytest.mark.parametrize("time_ms", [8_640_000_000_000_001, -8_640_000_000_000_001])
+def test_daily_bucketing_rejects_timestamps_outside_ecmascript_timeclip(
+    time_ms: int,
+) -> None:
+    with pytest.raises(ValidationError, match="TimeClip"):
+        _metrics([], eq_series=[{"time": time_ms, "equity": 100.0}])
+
+
 def test_wrong_type_benchmark_returns_produces_null_benchmark() -> None:
     metrics = _metrics([], benchmark_returns=cast(Sequence[float], True))
     assert metrics["benchmark"] == {
@@ -228,6 +253,46 @@ def test_metrics_cancellation_uses_left_to_right_addition() -> None:
     metrics = _metrics([_leg(time=1, pnl=1e16), _leg(time=2, pnl=1.0), _leg(time=3, pnl=-1e16)])
     assert metrics["total_pnl"] == 0.0
     assert metrics["expectancy"] == 0.0
+
+
+def test_overflowed_aggregate_fields_match_json_serialized_javascript_nulls() -> None:
+    metrics = _metrics(
+        [_leg(time=1, pnl=1e308), _leg(time=2, pnl=1e308)],
+        equity_start=1e308,
+        equity_final=1e308,
+    )
+    assert metrics["expectancy"] is None
+    assert metrics["total_r"] is None
+    assert metrics["avg_r"] is None
+    assert metrics["total_pnl"] is None
+    assert cast(Mapping[str, object], metrics["long"])["avg_pnl"] is None
+    assert cast(Mapping[str, object], metrics["long"])["avg_r"] is None
+    json.dumps(metrics, allow_nan=False)
+
+
+def test_overflowed_holding_and_daily_return_fields_are_json_null() -> None:
+    metrics = _metrics(
+        [_leg(time=1e308, pnl=1.0, open_time=-1e308)],
+        equity_start=100.0,
+        equity_final=101.0,
+        eq_series=[{"time": 0, "equity": 100.0}, {"time": 1, "equity": 101.0}],
+    )
+    assert metrics["avg_hold"] is None
+    assert metrics["avg_hold_min"] is None
+    assert metrics["exposure_pct"] is None
+    assert set(cast(Mapping[str, object], metrics["hold_dist_min"]).values()) == {None}
+    json.dumps(metrics, allow_nan=False)
+
+    daily_overflow = _metrics(
+        [],
+        eq_series=[{"time": 0, "equity": 5e-324}, {"time": 1, "equity": 1.0}],
+    )
+    assert cast(Mapping[str, object], daily_overflow["daily"])["avg_return"] is None
+    json.dumps(daily_overflow, allow_nan=False)
+
+    tiny_bar = _metrics([], est_bar_ms=5e-324, interval="custom")
+    assert tiny_bar["annualization_periods"] is None
+    json.dumps(tiny_bar, allow_nan=False)
 
 
 @pytest.mark.parametrize(

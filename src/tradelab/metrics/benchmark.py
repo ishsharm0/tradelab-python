@@ -6,7 +6,7 @@ import math
 from collections.abc import Sequence
 from typing import TypeGuard
 
-from .finite import _finite_number
+from .finite import _finite_number, _json_number
 
 _NULL_BENCHMARK: dict[str, None] = {
     "alpha": None,
@@ -75,9 +75,9 @@ def benchmark_stats(strategy_returns: object, benchmark_returns: object) -> dict
     tracking_error = _stddev(active)
     information_ratio = 0.0 if tracking_error == 0 else mean_active / tracking_error
     return {
-        "alpha": alpha,
-        "beta": beta,
-        "correlation": correlation,
-        "information_ratio": information_ratio,
-        "tracking_error": tracking_error,
+        "alpha": _json_number(alpha),
+        "beta": _json_number(beta),
+        "correlation": _json_number(correlation),
+        "information_ratio": _json_number(information_ratio),
+        "tracking_error": _json_number(tracking_error),
     }

@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
 from typing import TypeAlias
 
 from tradelab.errors import ValidationError
 
 from .annualize import _js_round_positive, periods_per_year
 from .benchmark import _mean, _stddev, benchmark_stats
-from .finite import BIG_NUMBER, Number, _finite_number, clamp_finite
+from .finite import BIG_NUMBER, Number, _finite_number, _json_number, clamp_finite
 
 ValidatedLeg: TypeAlias = tuple[Mapping[str, object], Mapping[str, object], float, float, bool]
 _PERCENTILE_RANKS: tuple[tuple[str, float], ...] = (
@@ -21,6 +20,8 @@ _PERCENTILE_RANKS: tuple[tuple[str, float], ...] = (
     ("p75", 0.75),
     ("p90", 0.9),
 )
+_MS_PER_DAY = 86_400_000
+_TIME_CLIP_LIMIT = 8_640_000_000_000_000
 
 
 def _sequence(value: object, name: str) -> Sequence[object]:
@@ -43,9 +44,12 @@ def _value(record: Mapping[str, object], camel: str, snake: str, default: object
     return default
 
 
-def _day_key_utc(time_ms: float) -> str:
-    date = datetime.fromtimestamp(time_ms / 1000, tz=UTC)
-    return date.strftime("%Y-%m-%d")
+def _day_key_utc(time_ms: float) -> int:
+    """Return an epoch-day key after ECMAScript Date TimeClip truncation."""
+    clipped = math.trunc(time_ms)
+    if abs(clipped) > _TIME_CLIP_LIMIT:
+        raise ValidationError("equity timestamp is outside the ECMAScript TimeClip range")
+    return clipped // _MS_PER_DAY
 
 
 def _sortino(values: Sequence[float]) -> float:
@@ -88,7 +92,7 @@ def _streaks(labels: Sequence[str]) -> tuple[int, int]:
 
 
 def _daily_returns(eq_series: Sequence[Mapping[str, float]]) -> list[float]:
-    records: dict[str, dict[str, float]] = {}
+    records: dict[int, dict[str, float]] = {}
     for point in eq_series:
         time = point["time"]
         equity = point["equity"]
@@ -180,7 +184,7 @@ def build_metrics(
     completed_count = winning_trade_count = winning_leg_count = 0
     total_r = realized_pnl = gross_profit_positions = gross_loss_positions = 0.0
     gross_profit_legs = gross_loss_legs = 0.0
-    open_bars = 0
+    open_bars: int | float = 0
     long_trades = long_wins = short_trades = short_wins = 0
     long_pnl = short_pnl = 0.0
     trade_rs: list[float] = []
@@ -270,18 +274,18 @@ def build_metrics(
         if daily_returns
         else 0.0
     )
-    side_breakdown: dict[str, dict[str, float | int]] = {
+    side_breakdown: dict[str, dict[str, float | int | None]] = {
         "long": {
             "trades": long_trades,
             "win_rate": long_wins / long_trades if long_trades else 0.0,
-            "avg_pnl": long_pnl / long_trades if long_trades else 0.0,
-            "avg_r": _mean(long_rs),
+            "avg_pnl": _json_number(long_pnl / long_trades) if long_trades else 0.0,
+            "avg_r": _json_number(_mean(long_rs)),
         },
         "short": {
             "trades": short_trades,
             "win_rate": short_wins / short_trades if short_trades else 0.0,
-            "avg_pnl": short_pnl / short_trades if short_trades else 0.0,
-            "avg_r": _mean(short_rs),
+            "avg_pnl": _json_number(short_pnl / short_trades) if short_trades else 0.0,
+            "avg_r": _json_number(_mean(short_rs)),
         },
     }
     benchmark_values = [] if benchmark_returns is None else benchmark_returns
@@ -292,25 +296,25 @@ def build_metrics(
         "trades": completed_count,
         "win_rate": winning_trade_count / completed_count if completed_count else 0.0,
         "profit_factor": clamp_finite(profit_factor_positions),
-        "expectancy": _mean(trade_pnls),
-        "total_r": total_r,
-        "avg_r": _mean(trade_rs),
+        "expectancy": _json_number(_mean(trade_pnls)),
+        "total_r": _json_number(total_r),
+        "avg_r": _json_number(_mean(trade_rs)),
         "sharpe": clamped_daily_sharpe,
         "sharpe_annualized": clamp_finite(clamped_daily_sharpe * math.sqrt(periods)),
         "sortino_annualized": clamp_finite(clamped_daily_sortino * math.sqrt(periods)),
         "sharpe_per_trade": clamp_finite(sharpe_per_trade),
         "sortino_per_trade": clamp_finite(_sortino(trade_returns)),
-        "annualization_periods": periods,
-        "max_drawdown": max_drawdown,
-        "max_drawdown_pct": max_drawdown,
+        "annualization_periods": periods if math.isfinite(periods) else None,
+        "max_drawdown": _json_number(max_drawdown),
+        "max_drawdown_pct": _json_number(max_drawdown),
         "calmar": clamp_finite(calmar),
         "max_consec_wins": max_wins,
         "max_consec_losses": max_losses,
-        "avg_hold": _mean(hold_minutes),
-        "avg_hold_min": _mean(hold_minutes),
-        "exposure_pct": open_bars / max(1, len(candle_values)),
-        "total_pnl": realized_pnl,
-        "return_pct": return_pct,
+        "avg_hold": _json_number(_mean(hold_minutes)),
+        "avg_hold_min": _json_number(_mean(hold_minutes)),
+        "exposure_pct": _json_number(open_bars / max(1, len(candle_values))),
+        "total_pnl": _json_number(realized_pnl),
+        "return_pct": _json_number(return_pct),
         "final_equity": final_equity,
         "start_equity": start_equity,
         "profit_factor_pos": clamp_finite(profit_factor_positions),
@@ -323,13 +327,16 @@ def build_metrics(
         "side_breakdown": side_breakdown,
         "long": side_breakdown["long"],
         "short": side_breakdown["short"],
-        "r_dist": {key: _percentile(trade_rs, rank) for key, rank in _PERCENTILE_RANKS},
+        "r_dist": {
+            key: _json_number(_percentile(trade_rs, rank)) for key, rank in _PERCENTILE_RANKS
+        },
         "hold_dist_min": {
-            key: _percentile(hold_minutes, rank) for key, rank in _PERCENTILE_RANKS
+            key: _json_number(_percentile(hold_minutes, rank))
+            for key, rank in _PERCENTILE_RANKS
         },
         "daily": {
             "count": len(daily_returns),
             "win_rate": daily_win_rate,
-            "avg_return": _mean(daily_returns),
+            "avg_return": _json_number(_mean(daily_returns)),
         },
     }

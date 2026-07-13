@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from importlib.util import find_spec
 
@@ -59,6 +60,13 @@ def test_clamp_finite_keeps_only_finite_non_boolean_numbers(
     assert clamp_finite(value, fallback) == expected
 
 
+def test_clamp_finite_never_leaks_conversion_overflow_or_nonfinite_fallback() -> None:
+    assert clamp_finite(10**10_000, 7.0) == BIG_NUMBER
+    assert clamp_finite(-(10**10_000), 7.0) == -BIG_NUMBER
+    assert clamp_finite(math.nan, math.inf) is None
+    json.dumps(clamp_finite(math.nan, math.inf), allow_nan=False)
+
+
 def test_benchmark_stats_handles_singletons_and_constant_sources() -> None:
     assert benchmark_stats([0.1], [0.2]) == {
         "alpha": 0.1,
@@ -93,6 +101,35 @@ def test_benchmark_stats_uses_explicit_left_to_right_population_moments() -> Non
 
     population = benchmark_stats([0.0, 2.0], [0.0, 0.0])
     assert population["tracking_error"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("strategy", "benchmark", "expected_information_ratio", "expected_tracking_error"),
+    [
+        ([1e308, -1e308], [1e308, -1e308], 0.0, 0.0),
+        ([1e308, 1e308], [-1e308, -1e308], None, None),
+    ],
+)
+def test_benchmark_stats_matches_json_serialized_js_for_overflowed_moments(
+    strategy: list[float],
+    benchmark: list[float],
+    expected_information_ratio: float | None,
+    expected_tracking_error: float | None,
+) -> None:
+    stats = benchmark_stats(strategy, benchmark)
+    assert stats == {
+        "alpha": None,
+        "beta": None,
+        "correlation": None,
+        "information_ratio": expected_information_ratio,
+        "tracking_error": expected_tracking_error,
+    }
+    json.dumps(stats, allow_nan=False)
+
+
+def test_periods_per_year_handles_binary64_overflow_like_javascript() -> None:
+    assert periods_per_year("custom", 10**10_000) == 252
+    assert periods_per_year("custom", 5e-324) == math.inf
 
 
 def test_benchmark_stats_returns_null_block_for_empty_or_mismatched_inputs() -> None:
