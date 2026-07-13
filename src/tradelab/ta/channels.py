@@ -5,7 +5,15 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
-from tradelab.utils.indicators import CandleInput, _number, _period, atr, candle_value, ema
+from tradelab.utils.indicators import (
+    CandleInput,
+    _number,
+    _period,
+    _sum_left_to_right,
+    atr,
+    candle_value,
+    ema,
+)
 
 
 def bollinger(
@@ -20,8 +28,10 @@ def bollinger(
     values = [_number(close, field="close") for close in closes]
     for index in range(period - 1, len(values)):
         window = values[index - period + 1 : index + 1]
-        middle = sum(window) / period
-        deviation = math.sqrt(sum((value - middle) ** 2 for value in window) / period)
+        middle = _sum_left_to_right(window) / period
+        deviation = math.sqrt(
+            _sum_left_to_right((value - middle) ** 2 for value in window) / period
+        )
         output["middle"][index] = middle
         output["upper"][index] = middle + multiplier * deviation
         output["lower"][index] = middle - multiplier * deviation
@@ -34,10 +44,11 @@ def donchian(bars: Sequence[CandleInput], period: int = 20) -> dict[str, list[fl
     output: dict[str, list[float | None]] = {
         key: [None] * len(bars) for key in ("upper", "lower", "middle")
     }
-    for index in range(period - 1, len(bars)):
-        window = bars[index - period + 1 : index + 1]
-        upper = max(candle_value(bar, "high") for bar in window)
-        lower = min(candle_value(bar, "low") for bar in window)
+    values = [(candle_value(bar, "high"), candle_value(bar, "low")) for bar in bars]
+    for index in range(period - 1, len(values)):
+        window = values[index - period + 1 : index + 1]
+        upper = max(high for high, _ in window)
+        lower = min(low for _, low in window)
         output["upper"][index], output["lower"][index] = upper, lower
         output["middle"][index] = (upper + lower) / 2
     return output

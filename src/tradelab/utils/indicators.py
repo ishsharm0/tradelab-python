@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TypeAlias, cast
 
 from tradelab.errors import ValidationError
@@ -28,6 +28,14 @@ def _number(value: object, *, field: str) -> float:
     if not math.isfinite(result):
         raise ValidationError(f"{field} must be finite", context={field: value})
     return result
+
+
+def _sum_left_to_right(values: Iterable[float]) -> float:
+    """Accumulate floats in JavaScript Number's explicit loop order."""
+    total = 0.0
+    for value in values:
+        total += value
+    return total
 
 
 def candle_value(candle: CandleInput, field: str) -> float:
@@ -87,14 +95,16 @@ def atr(bars: Sequence[CandleInput], period: int = 14) -> list[float | None]:
     period = _period(period)
     if not bars:
         return []
+    values = [
+        (candle_value(bar, "high"), candle_value(bar, "low"), candle_value(bar, "close"))
+        for bar in bars
+    ]
     true_ranges: list[float] = []
-    for index, bar in enumerate(bars):
-        high = candle_value(bar, "high")
-        low = candle_value(bar, "low")
+    for index, (high, low, _close) in enumerate(values):
         if index == 0:
             true_ranges.append(high - low)
         else:
-            previous_close = candle_value(bars[index - 1], "close")
+            previous_close = values[index - 1][2]
             true_ranges.append(
                 max(high - low, abs(high - previous_close), abs(low - previous_close))
             )
@@ -102,7 +112,7 @@ def atr(bars: Sequence[CandleInput], period: int = 14) -> list[float | None]:
     output: list[float | None] = [None] * len(true_ranges)
     if len(true_ranges) < period:
         return output
-    previous_atr = sum(true_ranges[:period]) / period
+    previous_atr = _sum_left_to_right(true_ranges[:period]) / period
     output[period - 1] = previous_atr
     for index in range(period, len(true_ranges)):
         previous_atr = (previous_atr * (period - 1) + true_ranges[index]) / period

@@ -46,7 +46,32 @@ def test_stochastic_k_stays_in_range_and_d_has_warmup() -> None:
     assert result["d"][:15] == [None] * 15
 
 
+def test_stochastic_d_accumulates_left_to_right_like_javascript() -> None:
+    bars = [{"high": 100, "low": 0, "close": 100}] + [
+        {"high": 1, "low": 0, "close": 1e-17} for _ in range(8)
+    ]
+
+    assert stochastic(bars, 1, 9)["d"][-1] == 11.11111111111111
+
+
 @pytest.mark.parametrize("periods", [(0, 3), (14, 0), (0, 0)])
 def test_invalid_oscillator_periods_raise_validation_error(periods: tuple[int, int]) -> None:
     with pytest.raises(ValidationError):
         stochastic([{"high": 2, "low": 1, "close": 1.5}], *periods)
+
+
+@pytest.mark.parametrize(
+    ("indicator", "values", "period"),
+    [
+        (rsi, ["bad"], 14),
+        (stochastic, [{"high": 1}], 14),
+    ],
+)
+def test_oscillators_validate_short_malformed_inputs_before_warmup(
+    indicator: object, values: object, period: int
+) -> None:
+    with pytest.raises(ValidationError):
+        if indicator is rsi:
+            rsi(values, period)  # type: ignore[arg-type]
+        else:
+            stochastic(values, period, 3)  # type: ignore[arg-type]

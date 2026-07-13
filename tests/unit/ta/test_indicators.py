@@ -45,6 +45,14 @@ def test_atr_has_none_warmup_and_uses_wilder_smoothing() -> None:
     assert atr(bars, 3) == [None, None, 2.0, 2.0]
 
 
+def test_atr_seed_accumulates_left_to_right_like_javascript() -> None:
+    bars = [{"high": 1e16, "low": 0, "close": 0}] + [
+        {"high": 1, "low": 0, "close": 0} for _ in range(4)
+    ]
+
+    assert atr(bars, 5)[-1] == 2_000_000_000_000_000.0
+
+
 def test_swing_fvg_and_structure_helpers_preserve_object_shapes() -> None:
     bars = [
         {"high": 5, "low": 1, "close": 3},
@@ -87,6 +95,11 @@ def test_invalid_indicator_periods_raise_validation_error(period: object) -> Non
 def test_invalid_indicator_input_raises_validation_error() -> None:
     with pytest.raises(ValidationError):
         atr([{"high": 2}], 2)
+
+
+def test_atr_validates_short_bars_missing_close_before_warmup() -> None:
+    with pytest.raises(ValidationError):
+        atr([{"high": 2, "low": 1}], 2)
 
 
 def test_basis_points_and_percent_change_match_javascript_primitives() -> None:

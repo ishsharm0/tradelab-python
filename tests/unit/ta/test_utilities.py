@@ -54,6 +54,23 @@ def test_rng_matches_javascript_for_astral_unicode_seed() -> None:
     ]
 
 
+def test_rng_coerces_integer_seeds_through_javascript_number_semantics() -> None:
+    assert make_rng(9_007_199_254_740_993)() == 0.8206203512381762
+
+
+@pytest.mark.parametrize(
+    ("seed", "javascript_string"),
+    [
+        pytest.param(10**10_000, "Infinity", id="positive-infinity"),
+        pytest.param(-(10**10_000), "-Infinity", id="negative-infinity"),
+    ],
+)
+def test_rng_coerces_overflowing_integer_seeds_to_javascript_infinity(
+    seed: int, javascript_string: str
+) -> None:
+    assert make_rng(seed)() == make_rng(javascript_string)()
+
+
 @pytest.mark.parametrize(
     ("seed", "javascript_string"),
     [(7.0, "7"), (None, "null"), (True, "true"), (False, "false")],

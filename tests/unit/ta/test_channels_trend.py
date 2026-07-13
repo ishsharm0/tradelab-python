@@ -27,6 +27,15 @@ def test_bollinger_middle_is_sma_and_width_is_symmetric() -> None:
     assert upper - middle == pytest.approx(middle - lower)
 
 
+def test_bollinger_accumulates_mean_and_deviation_left_to_right_like_javascript() -> None:
+    mean_result = bollinger([1e16, 1, -1e16], 3)
+    deviation_result = bollinger([1e16, -1e8, 1e4], 3)
+
+    assert mean_result["middle"][-1] == 0.0
+    assert deviation_result["upper"][-1] == 12_761_423_762_959_704.0
+    assert deviation_result["lower"][-1] == -6_094_757_162_953_036.0
+
+
 def test_donchian_tracks_rolling_high_and_low() -> None:
     bars = [{"high": 100 + index, "low": 90 + index, "close": 95 + index} for index in range(25)]
 
@@ -78,3 +87,13 @@ def test_vwap_resets_each_utc_day_and_falls_back_without_volume() -> None:
 def test_invalid_channel_period_raises_validation_error(period: int) -> None:
     with pytest.raises(ValidationError):
         bollinger([1, 2, 3], period)
+
+
+def test_donchian_validates_short_malformed_bars_before_warmup() -> None:
+    with pytest.raises(ValidationError):
+        donchian([{"high": 1}], 20)
+
+
+def test_supertrend_validates_short_bars_missing_close_before_warmup() -> None:
+    with pytest.raises(ValidationError):
+        supertrend([{"high": 1, "low": 0}], 10)

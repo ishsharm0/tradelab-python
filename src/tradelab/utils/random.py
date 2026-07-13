@@ -36,7 +36,11 @@ def _javascript_seed_string(seed: object) -> str:
     if isinstance(seed, bool):
         return "true" if seed else "false"
     if isinstance(seed, int):
-        return str(seed)
+        try:
+            value = float(seed)
+        except OverflowError:
+            value = math.inf if seed > 0 else -math.inf
+        return _javascript_number_string(value)
     if isinstance(seed, float):
         return _javascript_number_string(seed)
     raise ValidationError("seed must be a supported JavaScript primitive", context={"seed": seed})

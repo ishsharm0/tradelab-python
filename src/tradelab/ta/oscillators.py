@@ -4,16 +4,23 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from tradelab.utils.indicators import CandleInput, _number, _period, candle_value, ema
+from tradelab.utils.indicators import (
+    CandleInput,
+    _number,
+    _period,
+    _sum_left_to_right,
+    candle_value,
+    ema,
+)
 
 
 def rsi(closes: Sequence[float | int], period: int = 14) -> list[float | None]:
     """Return Wilder's RSI with ``None`` values before the warmup completes."""
     period = _period(period)
-    output: list[float | None] = [None] * len(closes)
-    if len(closes) <= period:
-        return output
     values = [_number(close, field="close") for close in closes]
+    output: list[float | None] = [None] * len(values)
+    if len(values) <= period:
+        return output
     gain_sum = 0.0
     loss_sum = 0.0
     for index in range(1, period + 1):
@@ -59,17 +66,21 @@ def stochastic(
     """Return stochastic %K and its simple-moving-average %D signal."""
     k_period = _period(k_period, name="k_period")
     d_period = _period(d_period, name="d_period")
-    k: list[float | None] = [None] * len(bars)
-    for index in range(k_period - 1, len(bars)):
-        window = bars[index - k_period + 1 : index + 1]
-        high = max(candle_value(bar, "high") for bar in window)
-        low = min(candle_value(bar, "low") for bar in window)
+    ohlc_values = [
+        (candle_value(bar, "high"), candle_value(bar, "low"), candle_value(bar, "close"))
+        for bar in bars
+    ]
+    k: list[float | None] = [None] * len(ohlc_values)
+    for index in range(k_period - 1, len(ohlc_values)):
+        window = ohlc_values[index - k_period + 1 : index + 1]
+        high = max(high for high, _, _ in window)
+        low = min(low for _, low, _ in window)
         range_ = high - low
-        k[index] = 0.0 if range_ == 0 else (candle_value(bars[index], "close") - low) / range_ * 100
-    d: list[float | None] = [None] * len(bars)
-    for index in range(k_period + d_period - 2, len(bars)):
-        values = k[index - d_period + 1 : index + 1]
-        if any(value is None for value in values):
+        k[index] = 0.0 if range_ == 0 else (ohlc_values[index][2] - low) / range_ * 100
+    d: list[float | None] = [None] * len(ohlc_values)
+    for index in range(k_period + d_period - 2, len(ohlc_values)):
+        k_window = k[index - d_period + 1 : index + 1]
+        if any(value is None for value in k_window):
             raise AssertionError("stochastic d window must contain initialized k values")
-        d[index] = sum(value for value in values if value is not None) / d_period
+        d[index] = _sum_left_to_right(value for value in k_window if value is not None) / d_period
     return {"k": k, "d": d}
