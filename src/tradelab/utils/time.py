@@ -12,19 +12,23 @@ NEW_YORK = ZoneInfo("America/New_York")
 Window = dict[str, int]
 
 
-def _et_datetime(time_ms: int | float | datetime) -> datetime:
+def _utc_datetime(time_ms: int | float | datetime) -> datetime:
     if isinstance(time_ms, datetime):
         if time_ms.tzinfo is None or time_ms.utcoffset() is None:
             raise ValidationError("time must be timezone-aware", context={"time": time_ms})
-        return time_ms.astimezone(NEW_YORK)
+        return time_ms.astimezone(UTC)
     if isinstance(time_ms, bool) or not isinstance(time_ms, (int, float)):
         raise ValidationError("time must be Unix milliseconds", context={"time": time_ms})
     try:
-        return datetime.fromtimestamp(time_ms / 1_000, tz=UTC).astimezone(NEW_YORK)
+        return datetime.fromtimestamp(time_ms / 1_000, tz=UTC)
     except (OverflowError, OSError, ValueError) as error:
         raise ValidationError(
             "time must be Unix milliseconds", context={"time": time_ms}
         ) from error
+
+
+def _et_datetime(time_ms: int | float | datetime) -> datetime:
+    return _utc_datetime(time_ms).astimezone(NEW_YORK)
 
 
 def offset_et(time_ms: int | float | datetime) -> int:
@@ -43,21 +47,18 @@ def minutes_et(time_ms: int | float | datetime) -> int:
 
 def is_session(time_ms: int | float | datetime, session: str = "NYSE") -> bool:
     """Return whether a timestamp is within the named NYSE, futures, or AUTO session."""
-    value = _et_datetime(time_ms)
+    utc_value = _utc_datetime(time_ms)
+    value = utc_value.astimezone(NEW_YORK)
     name = session.upper()
     if name not in {"NYSE", "FUT", "AUTO"}:
         raise ValidationError("session must be NYSE, FUT, or AUTO", context={"session": session})
     minutes = value.hour * 60 + value.minute
+    if utc_value.weekday() >= 5:
+        return name == "FUT" and (minutes >= 18 * 60 or minutes < 17 * 60)
     if name == "AUTO":
         return True
     if name == "FUT":
-        if value.weekday() == 5:
-            return minutes < 17 * 60
-        if value.weekday() == 6:
-            return minutes >= 18 * 60
         return not 17 * 60 <= minutes < 18 * 60
-    if value.weekday() >= 5:
-        return False
     return 9 * 60 + 30 <= minutes <= 16 * 60
 
 

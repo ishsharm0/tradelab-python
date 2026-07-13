@@ -44,6 +44,27 @@ def test_different_rng_seeds_diverge() -> None:
     assert make_rng("abc")() != make_rng("xyz")()
 
 
+def test_rng_matches_javascript_for_astral_unicode_seed() -> None:
+    rng = make_rng("💹")
+
+    assert [rng() for _ in range(3)] == [
+        0.28879048582166433,
+        0.0992135307751596,
+        0.5422337634954602,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("seed", "javascript_string"),
+    [(7.0, "7"), (None, "null"), (True, "true"), (False, "false")],
+)
+def test_rng_matches_javascript_string_coercion(seed: object, javascript_string: str) -> None:
+    object_seeded = make_rng(seed)
+    string_seeded = make_rng(javascript_string)
+
+    assert [object_seeded() for _ in range(3)] == [string_seeded() for _ in range(3)]
+
+
 def test_position_size_applies_risk_leverage_and_quantity_step() -> None:
     assert calculate_position_size(equity=10_000, entry=100, stop=99) == pytest.approx(100)
     assert calculate_position_size(
@@ -70,8 +91,19 @@ def test_new_york_offset_minutes_and_sessions_handle_dst_boundaries() -> None:
     assert minutes_et(after_dst) == 180
     assert is_session(nyse_open, "NYSE") is True
     assert is_session(nyse_open - 60_000, "NYSE") is False
-    assert is_session(after_dst, "FUT") is False
+    assert is_session(after_dst, "FUT") is True
     assert is_session(futures_open, "FUT") is True
+
+
+def test_sessions_apply_utc_weekend_rule_before_auto_and_use_eastern_minutes() -> None:
+    dst_transition = _ms(datetime(2025, 3, 9, 7, 0, tzinfo=UTC))
+    saturday_1700 = _ms(datetime(2025, 3, 8, 22, 0, tzinfo=UTC))
+    saturday_1800 = _ms(datetime(2025, 3, 8, 23, 0, tzinfo=UTC))
+
+    assert is_session(dst_transition, "AUTO") is False
+    assert is_session(dst_transition, "FUT") is True
+    assert is_session(saturday_1700, "FUT") is False
+    assert is_session(saturday_1800, "FUT") is True
 
 
 def test_session_windows_are_inclusive_and_parsed_from_csv() -> None:
