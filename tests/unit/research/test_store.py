@@ -133,8 +133,13 @@ def test_store_rejects_integers_outside_portable_binary64_range(tmp_path: Path) 
 
     with pytest.raises(ValidationError):
         store.log("portable-integer", metrics={"sharpe": 10**10_000})
-
+    with pytest.raises(ValidationError):
+        store.log("portable-integer", params={"integer": 2**53})
     assert path.read_bytes() == original
+
+    store.log("portable-integer", params={"integer": 2**53 - 1})
+
+    assert path.read_bytes() != original
 
 
 def test_store_normalizes_nested_json_values_and_requires_boolean_overfit(tmp_path: Path) -> None:

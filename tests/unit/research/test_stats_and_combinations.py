@@ -55,6 +55,11 @@ def test_statistics_wrap_binary64_conversion_overflow(
         function(value)  # type: ignore[operator]
 
 
+def test_moments_rejects_nonfinite_intermediate_moments() -> None:
+    with pytest.raises(ValidationError):
+        moments([1e100, -1e100])
+
+
 def test_combinations_are_lexicographic() -> None:
     assert combinations(4, 2) == [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]]
 

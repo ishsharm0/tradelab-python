@@ -22,6 +22,7 @@ _SAFE_ID = re.compile(r"^[\w.-]+$", re.ASCII)
 _LOCK_TIMEOUT_SECONDS = 5.0
 _STALE_LOCK_SECONDS = 30.0
 _LOCK_POLL_SECONDS = 0.01
+_MAX_SAFE_INTEGER = (1 << 53) - 1
 _thread_lock_guard = threading.Lock()
 
 
@@ -213,6 +214,11 @@ def _normalize_json_value(value: object, *, field: str, seen: set[int] | None = 
     if value is None or isinstance(value, (str, bool)):
         return value
     if isinstance(value, int) and not isinstance(value, bool):
+        if abs(value) > _MAX_SAFE_INTEGER:
+            raise ValidationError(
+                "research integers must be exact portable binary64 values",
+                context={"field": field, "max_safe_integer": _MAX_SAFE_INTEGER},
+            )
         try:
             normalized_number = float(value)
         except OverflowError as error:

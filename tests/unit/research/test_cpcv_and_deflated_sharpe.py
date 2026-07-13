@@ -109,3 +109,8 @@ def test_deflated_sharpe_wraps_overflow_and_requires_integral_observation_counts
 ) -> None:
     with pytest.raises(ValidationError):
         deflated_sharpe(**kwargs)  # type: ignore[arg-type]
+
+
+def test_deflated_sharpe_rejects_nonfinite_intermediate_variance() -> None:
+    with pytest.raises(ValidationError):
+        deflated_sharpe(sharpe=1e308, sample_size=10)

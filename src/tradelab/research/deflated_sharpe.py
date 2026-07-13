@@ -67,8 +67,10 @@ def deflated_sharpe(
     skewness = _finite(skew, name="skew")
     kurt = _finite(kurtosis, name="kurtosis")
     null_sharpe = sweep_haircut(num_trials=num_trials, sharpe_std=sharpe_std)["expected_max_sharpe"]
-    denominator = math.sqrt(
-        max(1e-12, 1 - skewness * observed_sharpe + ((kurt - 1) / 4) * observed_sharpe**2)
-    )
+    squared_sharpe = observed_sharpe * observed_sharpe
+    variance_term = 1 - skewness * observed_sharpe + ((kurt - 1) / 4) * squared_sharpe
+    if not math.isfinite(variance_term):
+        raise ValidationError("Sharpe inputs produced a non-finite variance adjustment")
+    denominator = math.sqrt(max(1e-12, variance_term))
     z_score = ((observed_sharpe - null_sharpe) * math.sqrt(max(1, size - 1))) / denominator
     return normal_cdf(z_score)

@@ -131,6 +131,8 @@ def moments(values: Sequence[Number]) -> Moments:
     for value in numeric_values:
         total += value
     mean = total / count
+    if not math.isfinite(mean):
+        raise ValidationError("values produced a non-finite mean")
     second = 0.0
     third = 0.0
     fourth = 0.0
@@ -142,7 +144,11 @@ def moments(values: Sequence[Number]) -> Moments:
     second /= count
     third /= count
     fourth /= count
+    if not all(math.isfinite(moment) for moment in (second, third, fourth)):
+        raise ValidationError("values produced non-finite population moments")
     std = math.sqrt(second)
-    skew = 0.0 if std == 0 else third / std**3
-    kurtosis = 3.0 if second == 0 else fourth / second**2
+    skew_denominator = std * std * std
+    kurtosis_denominator = second * second
+    skew = 0.0 if std == 0 else third / skew_denominator
+    kurtosis = 3.0 if second == 0 else fourth / kurtosis_denominator
     return Moments(mean=mean, std=std, skew=skew, kurtosis=kurtosis)
