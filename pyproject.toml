@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tradelab"
+version = "1.3.1"
+description = "Agent-native Python trading engine for research, backtesting, and live execution"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Ish Sharma" }]
+keywords = ["trading", "backtesting", "quantitative-finance", "algorithmic-trading", "mcp"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Financial and Insurance Industry",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Office/Business :: Financial :: Investment",
+  "Typing :: Typed",
+]
+dependencies = [
+  "fastapi>=0.115",
+  "httpx>=0.27",
+  "jinja2>=3.1",
+  "mcp>=1.9",
+  "rich>=13.9",
+  "typer>=0.15",
+  "uvicorn>=0.34",
+]
+
+[project.optional-dependencies]
+ib = ["ib-insync>=0.9.86"]
+dev = [
+  "build>=1.2",
+  "hypothesis>=6.130",
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "pytest-cov>=6.0",
+  "ruff>=0.11",
+  "twine>=6.1",
+]
+
+[project.scripts]
+tradelab = "tradelab.cli.app:main"
+tradelab-mcp = "tradelab.mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/ishsharm0/tradelab"
+Repository = "https://github.com/ishsharm0/tradelab"
+Issues = "https://github.com/ishsharm0/tradelab/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tradelab"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["tradelab"]
+
