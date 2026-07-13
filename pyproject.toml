@@ -45,10 +45,6 @@ dev = [
   "twine>=6.1",
 ]
 
-[project.scripts]
-tradelab = "tradelab.cli.app:main"
-tradelab-mcp = "tradelab.mcp.server:main"
-
 [project.urls]
 Homepage = "https://github.com/ishsharm0/tradelab"
 Repository = "https://github.com/ishsharm0/tradelab"
@@ -73,4 +69,3 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 python_version = "3.11"
 strict = true
 packages = ["tradelab"]
-

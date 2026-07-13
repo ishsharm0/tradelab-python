@@ -25,25 +25,32 @@ def _utc_datetime(value: datetime | int) -> datetime:
     return datetime.fromtimestamp(value / 1_000, tz=UTC)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class Candle:
     """An OHLCV market-data bar with its timestamp normalized to UTC."""
 
-    time: datetime | int
+    time: datetime
     open: float
     high: float
     low: float
     close: float
     volume: float | None = None
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "time", _utc_datetime(self.time))
-        object.__setattr__(self, "open", float(self.open))
-        object.__setattr__(self, "high", float(self.high))
-        object.__setattr__(self, "low", float(self.low))
-        object.__setattr__(self, "close", float(self.close))
-        if self.volume is not None:
-            object.__setattr__(self, "volume", float(self.volume))
+    def __init__(
+        self,
+        time: datetime | int,
+        open: float,
+        high: float,
+        low: float,
+        close: float,
+        volume: float | None = None,
+    ) -> None:
+        object.__setattr__(self, "time", _utc_datetime(time))
+        object.__setattr__(self, "open", float(open))
+        object.__setattr__(self, "high", float(high))
+        object.__setattr__(self, "low", float(low))
+        object.__setattr__(self, "close", float(close))
+        object.__setattr__(self, "volume", float(volume) if volume is not None else None)
 
     @property
     def time_ms(self) -> int:
