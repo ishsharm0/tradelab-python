@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from importlib.util import find_spec
 
 import pytest
 
@@ -34,6 +35,11 @@ def test_periods_per_year_uses_positive_javascript_rounding_for_estimates() -> N
     assert periods_per_year("unknown", 12_614_400_000) == 3
     assert periods_per_year("1d", 12_614_400_000) == 252
     assert periods_per_year(None, None) == 252
+
+
+def test_periods_per_year_preserves_large_integral_javascript_quotients() -> None:
+    estimate = 31_536_000_000 / 9_007_199_254_740_991
+    assert periods_per_year("custom", estimate) == 9_007_199_254_740_991
 
 
 @pytest.mark.parametrize(
@@ -101,12 +107,30 @@ def test_benchmark_stats_returns_null_block_for_empty_or_mismatched_inputs() -> 
     assert benchmark_stats([0.01], [0.01, 0.02]) == expected
 
 
+@pytest.mark.parametrize("strategy, benchmark", [(True, [0.0]), ([0.0], True)])
+def test_benchmark_stats_returns_null_block_for_wrong_type_inputs(
+    strategy: object, benchmark: object
+) -> None:
+    assert benchmark_stats(strategy, benchmark) == {
+        "alpha": None,
+        "beta": None,
+        "correlation": None,
+        "information_ratio": None,
+        "tracking_error": None,
+    }
+
+
 @pytest.mark.parametrize(
     "strategy, benchmark",
-    [([math.nan], [0.0]), ([0.0], [math.inf]), (True, [0.0])],
+    [([math.nan], [0.0]), ([0.0], [math.inf])],
 )
-def test_benchmark_stats_rejects_malformed_or_nonfinite_public_inputs(
+def test_benchmark_stats_rejects_nonfinite_sequence_members(
     strategy: object, benchmark: object
 ) -> None:
     with pytest.raises(ValidationError):
-        benchmark_stats(strategy, benchmark)  # type: ignore[arg-type]
+        benchmark_stats(strategy, benchmark)
+
+
+def test_metrics_public_functions_are_available_from_approved_modules() -> None:
+    for module in ("annualize", "finite", "benchmark", "build"):
+        assert find_spec(f"tradelab.metrics.{module}") is not None

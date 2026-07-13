@@ -1,37 +1,19 @@
-"""Stable, JSON-safe metrics for completed backtest trade legs."""
+"""Aggregate metrics for completed backtest trade legs."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import TypeAlias, cast
+from typing import TypeAlias
 
 from tradelab.errors import ValidationError
 
-BIG_NUMBER = 1e9
-_MS_PER_YEAR = 365 * 24 * 60 * 60 * 1000
-_INTERVAL_PERIODS: dict[str, int] = {
-    "1m": 98_280,
-    "2m": 49_140,
-    "5m": 19_656,
-    "15m": 6_552,
-    "30m": 3_276,
-    "1h": 1_638,
-    "60m": 1_638,
-    "1d": 252,
-    "1wk": 52,
-    "1mo": 12,
-}
-_NULL_BENCHMARK: dict[str, None] = {
-    "alpha": None,
-    "beta": None,
-    "correlation": None,
-    "information_ratio": None,
-    "tracking_error": None,
-}
-Number: TypeAlias = int | float
-ValidatedLeg: TypeAlias = tuple[Mapping[str, object], Mapping[str, object], float, float]
+from .annualize import _js_round_positive, periods_per_year
+from .benchmark import _mean, _stddev, benchmark_stats
+from .finite import BIG_NUMBER, Number, _finite_number, clamp_finite
+
+ValidatedLeg: TypeAlias = tuple[Mapping[str, object], Mapping[str, object], float, float, bool]
 _PERCENTILE_RANKS: tuple[tuple[str, float], ...] = (
     ("p10", 0.1),
     ("p25", 0.25),
@@ -39,19 +21,6 @@ _PERCENTILE_RANKS: tuple[tuple[str, float], ...] = (
     ("p75", 0.75),
     ("p90", 0.9),
 )
-
-
-def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _finite_number(value: object, name: str) -> float:
-    if not _is_number(value):
-        raise ValidationError(f"{name} must be a finite non-boolean number")
-    number = float(cast(Number, value))
-    if not math.isfinite(number):
-        raise ValidationError(f"{name} must be a finite non-boolean number")
-    return number
 
 
 def _sequence(value: object, name: str) -> Sequence[object]:
@@ -66,111 +35,6 @@ def _mapping(value: object, name: str) -> Mapping[str, object]:
     return value
 
 
-def _sum(values: Sequence[float]) -> float:
-    total = 0.0
-    for value in values:
-        total += value
-    return total
-
-
-def _mean(values: Sequence[float]) -> float:
-    return _sum(values) / len(values) if values else 0.0
-
-
-def _stddev(values: Sequence[float]) -> float:
-    if len(values) <= 1:
-        return 0.0
-    average = _mean(values)
-    squared_differences: list[float] = []
-    for value in values:
-        difference = value - average
-        squared_differences.append(difference * difference)
-    return math.sqrt(_mean(squared_differences))
-
-
-def _sortino(values: Sequence[float]) -> float:
-    losses: list[float] = []
-    for value in values:
-        if value < 0:
-            losses.append(value)
-    downside_deviation = _stddev(losses if losses else [0.0])
-    average = _mean(values)
-    return math.inf if downside_deviation == 0 and average > 0 else (
-        0.0 if downside_deviation == 0 else average / downside_deviation
-    )
-
-
-def _js_round_positive(value: float) -> int:
-    """Return the positive-number behavior of JavaScript's Math.round."""
-    return math.floor(value + 0.5)
-
-
-def clamp_finite(value: object, fallback: float = 0.0) -> float:
-    """Return a finite JSON-safe metric, retaining finite values without capping."""
-    if _is_number(value):
-        number = float(cast(Number, value))
-        if number == math.inf:
-            return BIG_NUMBER
-        if number == -math.inf:
-            return -BIG_NUMBER
-        if math.isfinite(number):
-            return number
-    return fallback
-
-
-def periods_per_year(interval: str | None, est_bar_ms: Number | None) -> int:
-    """Return annualization periods using known trading intervals or a 24/7 estimate."""
-    if interval in _INTERVAL_PERIODS:
-        return _INTERVAL_PERIODS[interval]
-    if _is_number(est_bar_ms):
-        bar_ms = float(cast(Number, est_bar_ms))
-        if math.isfinite(bar_ms) and bar_ms > 0:
-            return _js_round_positive(_MS_PER_YEAR / bar_ms)
-    return 252
-
-
-def benchmark_stats(
-    strategy_returns: Sequence[Number], benchmark_returns: Sequence[Number]
-) -> dict[str, float | None]:
-    """Return population OLS and active-return metrics for aligned return series."""
-    strategy_values = _sequence(strategy_returns, "strategy_returns")
-    benchmark_values = _sequence(benchmark_returns, "benchmark_returns")
-    if not strategy_values or len(strategy_values) != len(benchmark_values):
-        return dict(_NULL_BENCHMARK)
-
-    strategy = [_finite_number(value, "strategy_returns item") for value in strategy_values]
-    benchmark = [_finite_number(value, "benchmark_returns item") for value in benchmark_values]
-    mean_strategy = _mean(strategy)
-    mean_benchmark = _mean(benchmark)
-    covariance = 0.0
-    variance_benchmark = 0.0
-    variance_strategy = 0.0
-    for index, strategy_value in enumerate(strategy):
-        strategy_delta = strategy_value - mean_strategy
-        benchmark_delta = benchmark[index] - mean_benchmark
-        covariance += strategy_delta * benchmark_delta
-        variance_benchmark += benchmark_delta * benchmark_delta
-        variance_strategy += strategy_delta * strategy_delta
-
-    beta = 0.0 if variance_benchmark == 0 else covariance / variance_benchmark
-    alpha = mean_strategy - beta * mean_benchmark
-    denominator = math.sqrt(variance_strategy * variance_benchmark)
-    correlation = 0.0 if denominator == 0 else covariance / denominator
-    active: list[float] = []
-    for index, strategy_value in enumerate(strategy):
-        active.append(strategy_value - benchmark[index])
-    mean_active = _mean(active)
-    tracking_error = _stddev(active)
-    information_ratio = 0.0 if tracking_error == 0 else mean_active / tracking_error
-    return {
-        "alpha": alpha,
-        "beta": beta,
-        "correlation": correlation,
-        "information_ratio": information_ratio,
-        "tracking_error": tracking_error,
-    }
-
-
 def _value(record: Mapping[str, object], camel: str, snake: str, default: object = None) -> object:
     if camel in record:
         return record[camel]
@@ -182,6 +46,15 @@ def _value(record: Mapping[str, object], camel: str, snake: str, default: object
 def _day_key_utc(time_ms: float) -> str:
     date = datetime.fromtimestamp(time_ms / 1000, tz=UTC)
     return date.strftime("%Y-%m-%d")
+
+
+def _sortino(values: Sequence[float]) -> float:
+    losses = [value for value in values if value < 0]
+    downside_deviation = _stddev(losses if losses else [0.0])
+    average = _mean(values)
+    return math.inf if downside_deviation == 0 and average > 0 else (
+        0.0 if downside_deviation == 0 else average / downside_deviation
+    )
 
 
 def _trade_r_multiple(trade: Mapping[str, object], exit_data: Mapping[str, object]) -> float:
@@ -257,9 +130,11 @@ def _validated_leg(value: object, index: int) -> ValidatedLeg:
     exit_data = _mapping(_value(trade, "exit", "exit"), f"closed[{index}].exit")
     exit_time = _finite_number(_value(exit_data, "time", "time"), f"closed[{index}].exit.time")
     pnl = _finite_number(_value(exit_data, "pnl", "pnl"), f"closed[{index}].exit.pnl")
-    _finite_number(_value(exit_data, "price", "price"), f"closed[{index}].exit.price")
-    _finite_number(_value(trade, "openTime", "open_time"), f"closed[{index}].open_time")
-    return trade, exit_data, exit_time, pnl
+    is_scale = _value(exit_data, "reason", "reason") == "SCALE"
+    if not is_scale:
+        _finite_number(_value(exit_data, "price", "price"), f"closed[{index}].exit.price")
+        _finite_number(_value(trade, "openTime", "open_time"), f"closed[{index}].open_time")
+    return trade, exit_data, exit_time, pnl, is_scale
 
 
 def _equity_points(value: object) -> list[Mapping[str, float]]:
@@ -318,7 +193,7 @@ def build_metrics(
     peak_equity = current_equity = start_equity
     max_drawdown = 0.0
 
-    for trade, exit_data, exit_time, pnl in legs:
+    for trade, exit_data, exit_time, pnl, is_scale in legs:
         realized_pnl += pnl
         if pnl > 0:
             gross_profit_legs += pnl
@@ -329,7 +204,7 @@ def build_metrics(
         peak_equity = max(peak_equity, current_equity)
         drawdown = (peak_equity - current_equity) / max(1e-12, peak_equity)
         max_drawdown = max(max_drawdown, drawdown)
-        if _value(exit_data, "reason", "reason") == "SCALE":
+        if is_scale:
             continue
 
         completed_count += 1
@@ -369,7 +244,7 @@ def build_metrics(
         first_time = legs[0][2] if legs else 0.0
         equity_series = [{"time": first_time, "equity": start_equity}]
         reconstructed_equity = start_equity
-        for _, _, exit_time, pnl in legs:
+        for _, _, exit_time, pnl, _ in legs:
             reconstructed_equity += pnl
             equity_series.append({"time": exit_time, "equity": reconstructed_equity})
     daily_returns = _daily_returns(equity_series)
@@ -409,9 +284,8 @@ def build_metrics(
             "avg_r": _mean(short_rs),
         },
     }
-    benchmark = benchmark_stats(
-        daily_returns, [] if benchmark_returns is None else benchmark_returns
-    )
+    benchmark_values = [] if benchmark_returns is None else benchmark_returns
+    benchmark = benchmark_stats(daily_returns, benchmark_values)
     clamped_daily_sharpe = clamp_finite(sharpe_daily)
     clamped_daily_sortino = clamp_finite(sortino_daily)
     return {

@@ -130,6 +130,18 @@ def test_scale_legs_affect_realized_pnl_drawdown_and_leg_stats_only() -> None:
     assert metrics["win_rate_leg"] == 0.5
 
 
+def test_minimal_scale_legs_need_only_exit_time_pnl_and_reason() -> None:
+    later = {"exit": {"time": 2, "pnl": 10.0, "reason": "SCALE"}}
+    earlier = {"exit": {"time": 1, "pnl": -20.0, "reason": "SCALE"}}
+    metrics = _metrics([later, earlier], equity_start=1_000, equity_final=990)
+    assert metrics["trades"] == 0
+    assert metrics["total_pnl"] == -10.0
+    assert metrics["max_drawdown"] == pytest.approx(0.02)
+    assert metrics["profit_factor_leg"] == 0.5
+    assert metrics["win_rate_leg"] == 0.5
+    assert metrics["daily"] == {"count": 1, "win_rate": 0.0, "avg_return": -0.01}
+
+
 def test_sort_is_stable_and_never_mutates_input() -> None:
     first = _leg(time=1, pnl=-10)
     second = _leg(time=1, pnl=20)
@@ -170,6 +182,17 @@ def test_daily_returns_honor_utc_order_equal_times_filtered_days_and_benchmark_l
     )
     assert metrics["daily"] == {"count": 1, "win_rate": 1.0, "avg_return": 0.2}
     assert cast(Mapping[str, object], metrics["benchmark"])["beta"] is None
+
+
+def test_wrong_type_benchmark_returns_produces_null_benchmark() -> None:
+    metrics = _metrics([], benchmark_returns=cast(Sequence[float], True))
+    assert metrics["benchmark"] == {
+        "alpha": None,
+        "beta": None,
+        "correlation": None,
+        "information_ratio": None,
+        "tracking_error": None,
+    }
 
 
 def test_sharpe_sortino_edge_cases_and_unclamped_finite_annualization() -> None:
