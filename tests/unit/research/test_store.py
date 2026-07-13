@@ -125,6 +125,18 @@ def test_store_rejects_strict_json_values_without_changing_the_original_file(
     assert path.read_bytes() == original
 
 
+def test_store_rejects_integers_outside_portable_binary64_range(tmp_path: Path) -> None:
+    store = ResearchStore(tmp_path)
+    store.open("portable-integer")
+    path = tmp_path / "portable-integer.json"
+    original = path.read_bytes()
+
+    with pytest.raises(ValidationError):
+        store.log("portable-integer", metrics={"sharpe": 10**10_000})
+
+    assert path.read_bytes() == original
+
+
 def test_store_normalizes_nested_json_values_and_requires_boolean_overfit(tmp_path: Path) -> None:
     store = ResearchStore(tmp_path)
     store.log(

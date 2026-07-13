@@ -213,6 +213,16 @@ def _normalize_json_value(value: object, *, field: str, seen: set[int] | None = 
     if value is None or isinstance(value, (str, bool)):
         return value
     if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            normalized_number = float(value)
+        except OverflowError as error:
+            raise ValidationError(
+                "research integers must fit the portable binary64 range", context={"field": field}
+            ) from error
+        if not math.isfinite(normalized_number):
+            raise ValidationError(
+                "research integers must fit the portable binary64 range", context={"field": field}
+            )
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -327,7 +337,10 @@ def best_sharpe(entries: list[ResearchEntry]) -> BestSharpe | None:
         candidate = entry["metrics"].get("sharpe")
         if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
             continue
-        sharpe = float(candidate)
+        try:
+            sharpe = float(candidate)
+        except OverflowError:
+            continue
         if not math.isfinite(sharpe):
             continue
         if best is None or sharpe > best["sharpe"]:
@@ -404,6 +417,14 @@ class ResearchStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, path)
+        except (TypeError, ValueError, OverflowError, RecursionError) as error:
+            if temp_path is not None:
+                with suppress(OSError):
+                    temp_path.unlink(missing_ok=True)
+            raise ValidationError(
+                "research record could not be encoded as strict JSON",
+                context={"record_id": record_id},
+            ) from error
         except BaseException:
             if temp_path is not None:
                 with suppress(OSError):

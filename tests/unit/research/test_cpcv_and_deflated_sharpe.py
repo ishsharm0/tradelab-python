@@ -92,3 +92,20 @@ def test_sharpe_functions_reject_nonfinite_or_invalid_inputs(
 ) -> None:
     with pytest.raises(ValidationError):
         function(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"sharpe": 10**10_000, "sample_size": 10},
+        {"sharpe": 1, "sample_size": 10**10_000},
+        {"sharpe": 1, "sample_size": 1.5},
+        {"sharpe": 1, "sample_size": 10, "num_trials": 10**10_000},
+    ],
+    ids=["sharpe-overflow", "sample-overflow", "fractional-sample", "trials-overflow"],
+)
+def test_deflated_sharpe_wraps_overflow_and_requires_integral_observation_counts(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        deflated_sharpe(**kwargs)  # type: ignore[arg-type]

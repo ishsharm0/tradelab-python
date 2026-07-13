@@ -39,6 +39,22 @@ def test_moments_rejects_empty_or_nonfinite_values(values: list[float]) -> None:
         moments(values)
 
 
+@pytest.mark.parametrize(
+    ("function", "value"),
+    [
+        (normal_cdf, 10**10_000),
+        (normal_ppf, 10**10_000),
+        (moments, [1, 10**10_000]),
+    ],
+    ids=["normal-cdf", "normal-ppf", "moments"],
+)
+def test_statistics_wrap_binary64_conversion_overflow(
+    function: object, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        function(value)  # type: ignore[operator]
+
+
 def test_combinations_are_lexicographic() -> None:
     assert combinations(4, 2) == [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]]
 

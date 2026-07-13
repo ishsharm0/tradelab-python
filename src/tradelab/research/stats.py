@@ -23,9 +23,15 @@ class Moments:
 
 def _finite_number(value: Number, *, name: str) -> float:
     """Normalize a finite real numeric value or raise a contextual error."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError(f"{name} must be a finite number", context={name: value})
-    return float(value)
+    try:
+        normalized = float(value)
+    except OverflowError as error:
+        raise ValidationError(f"{name} must be a finite number", context={name: value}) from error
+    if not math.isfinite(normalized):
+        raise ValidationError(f"{name} must be a finite number", context={name: value})
+    return normalized
 
 
 def normal_cdf(value: Number) -> float:

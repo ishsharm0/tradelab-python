@@ -20,14 +20,21 @@ class SweepHaircut(TypedDict):
 
 
 def _finite(value: Number, *, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError(f"{name} must be a finite number", context={name: value})
-    return float(value)
+    try:
+        normalized = float(value)
+    except OverflowError as error:
+        raise ValidationError(f"{name} must be a finite number", context={name: value}) from error
+    if not math.isfinite(normalized):
+        raise ValidationError(f"{name} must be a finite number", context={name: value})
+    return normalized
 
 
 def _positive_integer(value: Number, *, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValidationError(f"{name} must be a positive integer", context={name: value})
+    _finite(value, name=name)
     return value
 
 
@@ -56,11 +63,9 @@ def deflated_sharpe(
 ) -> float:
     """Return the deflated Sharpe probability adjusted for trial selection."""
     observed_sharpe = _finite(sharpe, name="sharpe")
-    size = _finite(sample_size, name="sample_size")
+    size = _positive_integer(sample_size, name="sample_size")
     skewness = _finite(skew, name="skew")
     kurt = _finite(kurtosis, name="kurtosis")
-    if size <= 0:
-        raise ValidationError("sample_size must be positive", context={"sample_size": sample_size})
     null_sharpe = sweep_haircut(num_trials=num_trials, sharpe_std=sharpe_std)["expected_max_sharpe"]
     denominator = math.sqrt(
         max(1e-12, 1 - skewness * observed_sharpe + ((kurt - 1) / 4) * observed_sharpe**2)
