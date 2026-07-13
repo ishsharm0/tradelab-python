@@ -15,7 +15,7 @@ from typing import Any, TypedDict
 from tradelab.errors import ValidationError
 
 _DEFAULT_DIRECTORY = Path(".tradelab/research")
-_SAFE_ID = re.compile(r"^[\w.-]+$")
+_SAFE_ID = re.compile(r"^[\w.-]+$", re.ASCII)
 
 
 class ResearchEntry(TypedDict):

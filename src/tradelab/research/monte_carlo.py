@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TypedDict
 
 from tradelab.errors import ValidationError
@@ -86,6 +86,7 @@ def monte_carlo(
     iterations: Number = 1000,
     block_size: Number = 1,
     seed: object = "tradelab-mc",
+    rng: Callable[[], float] | None = None,
 ) -> MonteCarloResult:
     """Block-bootstrap PnL paths using TradeLab's deterministic seeded RNG.
 
@@ -107,7 +108,9 @@ def monte_carlo(
     if block < 1:
         raise ValidationError("block_size must be positive", context={"block_size": block_size})
 
-    rng = make_rng(seed)
+    if rng is not None and not callable(rng):
+        raise ValidationError("rng must be callable", context={"rng": rng})
+    random_source = make_rng(seed) if rng is None else rng
     count = len(pnls)
     finals: list[float] = []
     drawdowns: list[float] = []
@@ -117,7 +120,7 @@ def monte_carlo(
         equity = starting_equity
         filled = 0
         while filled < count:
-            start = rand_int(rng, count)
+            start = rand_int(random_source, count)
             for offset in range(block):
                 if filled >= count:
                     break

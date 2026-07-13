@@ -57,7 +57,7 @@ def test_store_open_log_recall_close_and_reopen(tmp_path: Path) -> None:
 def test_store_rejects_traversal_ids(tmp_path: Path) -> None:
     store = ResearchStore(tmp_path)
 
-    for record_id in ("../unsafe", "nested/id", "", "unsafe id"):
+    for record_id in ("../unsafe", "nested/id", "", "unsafe id", "café"):
         with pytest.raises(ValidationError):
             store.open(record_id)
 

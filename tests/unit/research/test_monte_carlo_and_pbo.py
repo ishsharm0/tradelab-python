@@ -22,6 +22,19 @@ def test_monte_carlo_is_deterministic_and_uses_floor_percentiles() -> None:
     assert first["path_bands"][1] == {"p5": 995, "p50": 1006, "p95": 1010}
 
 
+def test_monte_carlo_accepts_a_caller_owned_rng() -> None:
+    draws = iter([0.0, 0.5])
+
+    result = monte_carlo(
+        trade_pnls=[10, -4],
+        equity_start=100,
+        iterations=1,
+        rng=lambda: next(draws),
+    )
+
+    assert result["final_equity"]["p50"] == 106
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -30,6 +43,7 @@ def test_monte_carlo_is_deterministic_and_uses_floor_percentiles() -> None:
         {"trade_pnls": [1], "iterations": 0},
         {"trade_pnls": [1], "block_size": 0},
         {"trade_pnls": [1], "equity_start": math.inf},
+        {"trade_pnls": [1], "rng": 1},
     ],
 )
 def test_monte_carlo_rejects_invalid_numeric_inputs(kwargs: dict[str, object]) -> None:
