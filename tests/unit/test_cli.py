@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 from tradelab.cli import app
+from tradelab.live import JsonFileStorage
 
 RUNNER = CliRunner()
 
@@ -140,3 +142,14 @@ def test_portfolio_command_runs_multiple_csv_systems(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["systems"] == 2
     assert Path(payload["metricsPath"]).exists()
+
+
+def test_status_reads_one_persisted_namespace(tmp_path: Path) -> None:
+    storage = JsonFileStorage(base_dir=tmp_path)
+    asyncio.run(storage.save("paper-one", {"equity": 12_345, "savedAt": "now"}))
+    asyncio.run(storage.append_trade("paper-one", {"pnl": 5}))
+    result = RUNNER.invoke(app, ["status", "--dir", str(tmp_path), "--namespace", "paper-one"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["state"]["equity"] == 12_345
+    assert payload["trades"] == 1

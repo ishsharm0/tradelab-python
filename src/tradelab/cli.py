@@ -13,6 +13,7 @@ import typer
 from tradelab.data import get_historical_candles, load_candles_from_csv, save_candles_to_cache
 from tradelab.engine import backtest, backtest_portfolio, grid, walk_forward_optimize
 from tradelab.errors import TradeLabError, ValidationError
+from tradelab.live import JsonFileStorage
 from tradelab.reporting import export_backtest_artifacts, export_metrics_json, summarize
 from tradelab.strategies import get_strategy, list_strategies
 
@@ -388,6 +389,47 @@ def portfolio(
         )
     except typer.BadParameter:
         raise
+    except (TradeLabError, OSError, ValueError) as error:
+        _fail(error)
+
+
+@app.command()
+def status(
+    state_dir: Path = typer.Option(Path("output/live-state"), "--dir", "--state-dir"),
+    namespace: str | None = typer.Option(None, "--namespace", "--id"),
+) -> None:
+    """Read persisted live state without starting a broker or feed."""
+    try:
+        storage = JsonFileStorage(base_dir=state_dir)
+        if namespace:
+            state = _run(storage.load(namespace))
+            trades = _run(storage.load_trades(namespace))
+            equity = _run(storage.load_equity_curve(namespace))
+            payload = {
+                "namespace": namespace,
+                "state": state,
+                "trades": len(trades),
+                "equityPoints": len(equity),
+            }
+        elif not state_dir.exists():
+            payload = {"dir": str(state_dir), "namespaces": []}
+        else:
+            summaries: list[dict[str, object]] = []
+            for directory in sorted(path for path in state_dir.iterdir() if path.is_dir()):
+                state = _run(storage.load(directory.name))
+                trades = _run(storage.load_trades(directory.name))
+                state_mapping = state if isinstance(state, Mapping) else {}
+                summaries.append(
+                    {
+                        "namespace": directory.name,
+                        "savedAt": state_mapping.get("savedAt"),
+                        "equity": state_mapping.get("equity"),
+                        "openPosition": bool(state_mapping.get("openPosition")),
+                        "trades": len(trades),
+                    }
+                )
+            payload = {"dir": str(state_dir), "namespaces": summaries}
+        typer.echo(json.dumps(payload, indent=2, allow_nan=False))
     except (TradeLabError, OSError, ValueError) as error:
         _fail(error)
 
