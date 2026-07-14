@@ -36,6 +36,47 @@ async def test_orchestrator_starts_systems_allocates_weights_and_aggregates(tmp_
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_flattens_every_engine_before_shared_broker_disconnect(
+    tmp_path: Path,
+) -> None:
+    broker = PaperEngine(equity=20_000)
+    orchestrator = LiveOrchestrator(
+        systems=[
+            {"id": "a", "symbol": "AAA", "signal": lambda _context: None},
+            {"id": "b", "symbol": "BBB", "signal": lambda _context: None},
+        ],
+        broker=broker,
+        storage=JsonFileStorage(base_dir=tmp_path),
+    )
+    await orchestrator.start()
+    for engine, symbol in zip(orchestrator.engines, ("AAA", "BBB"), strict=True):
+        engine.open_position = {
+            "id": f"trade-{symbol}",
+            "symbol": symbol,
+            "side": "long",
+            "size": 1,
+            "entry": 100,
+            "entryFill": 100,
+            "stop": 98,
+            "takeProfit": 104,
+            "openTime": 1,
+        }
+        broker.positions[symbol] = {
+            "symbol": symbol,
+            "side": "long",
+            "qty": 1,
+            "avgEntry": 100,
+        }
+        broker.last_prices[symbol] = 101
+
+    await orchestrator.stop(flatten_on_shutdown=True)
+
+    assert await broker.get_positions() == []
+    assert broker.is_connected() is False
+    assert orchestrator.running is False
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_rolls_back_started_engines_when_later_start_fails() -> None:
     states: list[str] = []
 

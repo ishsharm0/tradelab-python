@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -26,7 +27,13 @@ class RuntimeEngine(Protocol):
 
     async def start(self) -> None: ...
 
-    async def stop(self) -> None: ...
+    async def stop(
+        self,
+        *,
+        flatten_on_shutdown: bool = False,
+        disconnect_feed: bool = True,
+        disconnect_broker: bool = True,
+    ) -> None: ...
 
     def get_status(self) -> dict[str, Any]: ...
 
@@ -192,14 +199,53 @@ class LiveOrchestrator:
                 },
             )
 
-    async def stop(self) -> None:
+    async def stop(self, *, flatten_on_shutdown: bool = False) -> None:
         async with self._lifecycle_lock:
             if not self.running and not self.engines:
                 return
-            outcomes = await asyncio.gather(
-                *(engine.stop() for engine in reversed(self.engines)),
-                return_exceptions=True,
-            )
+            engines = list(reversed(self.engines))
+            feeds: list[object] = []
+            for engine in engines:
+                feed = getattr(engine, "feed", None)
+                if feed is not None and all(feed is not current for current in feeds):
+                    feeds.append(feed)
+            outcomes: list[object] = []
+            for engine in engines:
+                try:
+                    parameters = inspect.signature(engine.stop).parameters
+                    owns_transport_controls = {
+                        "flatten_on_shutdown",
+                        "disconnect_feed",
+                        "disconnect_broker",
+                    }.issubset(parameters)
+                    if owns_transport_controls:
+                        await engine.stop(
+                            flatten_on_shutdown=flatten_on_shutdown,
+                            disconnect_feed=False,
+                            disconnect_broker=False,
+                        )
+                    elif flatten_on_shutdown:
+                        raise RuntimeError(
+                            "custom runtime engine cannot participate in safe portfolio flatten"
+                        )
+                    else:
+                        await engine.stop()
+                except BaseException as error:
+                    outcomes.append(error)
+                else:
+                    outcomes.append(None)
+            for feed in feeds:
+                disconnect = getattr(feed, "disconnect", None)
+                if callable(disconnect):
+                    try:
+                        await disconnect()
+                    except BaseException as error:
+                        outcomes.append(error)
+            if self.broker.is_connected():
+                try:
+                    await self.broker.disconnect()
+                except BaseException as error:
+                    outcomes.append(error)
             self.engines.clear()
             for unsubscribe in self._event_unsubscribers:
                 unsubscribe()

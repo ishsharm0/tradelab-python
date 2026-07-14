@@ -840,7 +840,13 @@ class LiveEngine:
             if self.broker.is_connected():
                 await self.broker.disconnect()
 
-    async def stop(self, *, flatten_on_shutdown: bool = False) -> None:
+    async def stop(
+        self,
+        *,
+        flatten_on_shutdown: bool = False,
+        disconnect_feed: bool = True,
+        disconnect_broker: bool = True,
+    ) -> None:
         async with self._lifecycle_lock:
             if not self.connected and not self.running:
                 return
@@ -878,9 +884,10 @@ class LiveEngine:
                 failure = error
             finally:
                 try:
-                    await self.feed.disconnect()
+                    if disconnect_feed:
+                        await self.feed.disconnect()
                 finally:
-                    if self.broker.is_connected():
+                    if disconnect_broker and self.broker.is_connected():
                         await self.broker.disconnect()
                     self._unwire_broker()
                     self.running = self.connected = False
