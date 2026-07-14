@@ -209,6 +209,57 @@ async def test_restart_mismatch_halts_risk_and_restores_state(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_restart_halts_when_persisted_exit_is_not_open_at_broker(tmp_path: Path) -> None:
+    storage = JsonFileStorage(base_dir=tmp_path)
+    position = {
+        "symbol": "A",
+        "side": "long",
+        "size": 1,
+        "entry": 10,
+        "entryFill": 10,
+        "stop": 9,
+        "takeProfit": 12,
+        "openTime": 1,
+        "_pendingExitOrderId": "vanished-order",
+        "_pendingExitClientOrderId": "restart-exit-1",
+    }
+    await storage.save(
+        "restart-exit",
+        {
+            "openPosition": position,
+            "equity": 10_000,
+            "candleBuffer": [],
+            "lastBarTime": None,
+            "dayPnl": 0,
+            "dayTrades": 0,
+            "tradeIdCounter": 1,
+        },
+    )
+    broker = PaperEngine()
+    broker.positions["A"] = {
+        "symbol": "A",
+        "side": "long",
+        "qty": 1,
+        "avgEntry": 10,
+    }
+    engine = LiveEngine(
+        id="restart-exit",
+        symbol="A",
+        signal=lambda _context: None,
+        broker=broker,
+        storage=storage,
+        warmup_bars=0,
+        use_broker_account_equity=False,
+    )
+
+    await engine.start()
+
+    assert engine.risk_manager.halted is True
+    assert engine.risk_manager.halt_reason == "pending exit order missing on restart"
+    await engine.stop()
+
+
+@pytest.mark.asyncio
 async def test_pending_limit_chases_then_expires_and_cancels(tmp_path: Path) -> None:
     broker = PaperEngine()
     broker.set_historical_bars("A", "1m", [_bar(1_735_828_200_000, 100)])

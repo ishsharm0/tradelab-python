@@ -764,6 +764,21 @@ class LiveEngine:
                     broker_positions=positions,
                     symbol=self.symbol,
                 )
+                pending_exit_reconcile_error: str | None = None
+                if self.open_position and self.open_position.get("_pendingExitClientOrderId"):
+                    try:
+                        open_orders = [_order(item) for item in await self.broker.get_open_orders()]
+                    except Exception:
+                        pending_exit_reconcile_error = (
+                            "unable to reconcile pending exit order on restart"
+                        )
+                    else:
+                        expected_exit = {
+                            "orderId": self.open_position.get("_pendingExitOrderId"),
+                            "clientOrderId": self.open_position.get("_pendingExitClientOrderId"),
+                        }
+                        if not any(_matches(expected_exit, order) for order in open_orders):
+                            pending_exit_reconcile_error = "pending exit order missing on restart"
                 if reconcile["action"] == "adopt-broker" and reconcile["adoptedPosition"]:
                     self.open_position = {
                         **(self.open_position or {}),
@@ -774,6 +789,8 @@ class LiveEngine:
                 self.risk_manager.day_pnl = self.day_pnl
                 if reconcile["action"] == "mismatch":
                     self.risk_manager.halt("position mismatch on restart")
+                elif pending_exit_reconcile_error is not None:
+                    self.risk_manager.halt(pending_exit_reconcile_error)
                 self._emit("reconciled", {"symbol": self.symbol, "reconcile": reconcile})
                 subscription = await self.feed.subscribe_bars(
                     self.symbol, self.interval, self.handle_bar
