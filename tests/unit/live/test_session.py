@@ -32,6 +32,9 @@ class SnakeCaseBroker:
     def supports_paper_native(self) -> bool:
         return True
 
+    def supports_order_updates(self) -> bool:
+        return True
+
     def on(self, event: str, handler: Callable[[dict[str, Any]], object]) -> Callable[[], None]:
         return self.events.on(event, handler)
 
@@ -185,6 +188,15 @@ async def test_multisymbol_prices_oco_and_exposure_use_each_position_value() -> 
 
 
 @pytest.mark.asyncio
+async def test_place_order_enforces_max_position_gate_before_broker_submission() -> None:
+    session = await _session(max_position_pct=0.1)
+    await session.push_bar(_bar(1, 100))
+    with pytest.raises(RiskRejectedError, match="max position size"):
+        await session.place_order(side="long", qty=11)
+    assert session.get_status()["positions"] == []
+
+
+@pytest.mark.asyncio
 async def test_close_flatten_and_risk_halt_block_new_orders() -> None:
     session = await _session(max_daily_loss_pct=1)
     await session.push_bar(_bar(1, 100))
@@ -246,6 +258,23 @@ async def test_live_session_normalizes_structural_external_broker_payloads(
     await session.stop()
 
 
+def test_live_session_fails_closed_without_streamed_order_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RestOnlyBroker(SnakeCaseBroker):
+        def supports_order_updates(self) -> bool:
+            return False
+
+    monkeypatch.setenv("TRADELAB_ALLOW_LIVE", "true")
+    with pytest.raises(LiveTradingDisabledError, match="order updates"):
+        TradingSession(
+            symbol="AAPL",
+            broker=RestOnlyBroker(),
+            mode="live",
+            confirm_live=True,
+        )
+
+
 @pytest.mark.asyncio
 async def test_start_stop_are_idempotent_and_cleanup_broker_listeners() -> None:
     broker = PaperEngine()
@@ -296,6 +325,87 @@ async def test_background_bracket_failures_are_drained_and_reported() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_oco_cancel_failure_retains_bracket_and_refresh_retries() -> None:
+    class FlakyCancelPaper(PaperEngine):
+        cancel_order_nowait = None  # type: ignore[assignment]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_cancel = True
+
+        async def cancel_order(self, order_id: str) -> None:
+            if self.fail_cancel:
+                self.fail_cancel = False
+                raise RuntimeError("cancel unavailable")
+            PaperEngine.cancel_order_nowait(self, order_id)
+
+    broker = FlakyCancelPaper()
+    session = await _session(broker=broker)
+    await session.push_bar(_bar(1, 100))
+    await session.place_order(side="long", qty=1, stop=98, target=104)
+    with pytest.raises(RuntimeError, match="cancel unavailable"):
+        await session.push_bar(_bar(2, 98, high=100, low=98))
+    assert "AAPL" in session.brackets
+    assert any(event["event"] == "error" for event in session.recent_events())
+    await session.refresh()
+    assert session.brackets == {}
+    assert session.get_status()["openOrders"] == []
+
+
+@pytest.mark.asyncio
+async def test_target_submission_failure_compensates_submitted_stop() -> None:
+    class RejectTargetPaper(PaperEngine):
+        async def submit_order(self, order: Mapping[str, object]) -> dict[str, Any]:
+            if order.get("type") == "limit":
+                raise RuntimeError("target unavailable")
+            return await super().submit_order(order)
+
+    session = await _session(broker=RejectTargetPaper())
+    await session.push_bar(_bar(1, 100))
+    with pytest.raises(RuntimeError, match="target unavailable"):
+        await session.place_order(side="long", qty=1, stop=98, target=104)
+    assert await session.broker.get_open_orders() == []
+    assert session.brackets == {}
+    assert session._bracket_recoveries == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_bracket_compensation_halts_and_refresh_reconciles() -> None:
+    class DoubleFailurePaper(PaperEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_cancel = True
+
+        async def submit_order(self, order: Mapping[str, object]) -> dict[str, Any]:
+            if order.get("type") == "limit":
+                raise RuntimeError("target unavailable")
+            return await super().submit_order(order)
+
+        async def cancel_order(self, order_id: str) -> None:
+            if self.fail_cancel:
+                self.fail_cancel = False
+                raise RuntimeError("cancel unavailable")
+            await super().cancel_order(order_id)
+
+    session = await _session(broker=DoubleFailurePaper())
+    await session.push_bar(_bar(1, 100))
+    with pytest.raises(RuntimeError, match="bracket compensation failed"):
+        await session.place_order(side="long", qty=1, stop=98, target=104)
+    assert session.risk_manager.halted is True
+    assert set(session.brackets["AAPL"]) == {"stopId"}
+    assert session._bracket_recoveries["AAPL"].get("stopId")
+    assert any(
+        event["payload"].get("operation") == "bracket-compensation"
+        for event in session.recent_events()
+        if event["event"] == "error"
+    )
+    await session.refresh()
+    assert await session.broker.get_open_orders() == []
+    assert session.brackets == {}
+    assert session._bracket_recoveries == {}
+
+
+@pytest.mark.asyncio
 async def test_session_manager_create_remove_halt_all_and_duplicate_safety() -> None:
     manager = SessionManager()
     first = await manager.create(id="one", symbol="A", equity=5_000)
@@ -311,3 +421,36 @@ async def test_session_manager_create_remove_halt_all_and_duplicate_safety() -> 
     await manager.halt_all()
     assert manager.list() == []
     assert second.running is False
+
+
+@pytest.mark.asyncio
+async def test_session_manager_cleans_up_only_factory_owned_broker_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoUpdatesBroker(SnakeCaseBroker):
+        def supports_order_updates(self) -> bool:
+            return False
+
+    owned = NoUpdatesBroker()
+
+    async def factory(_options: dict[str, object]) -> NoUpdatesBroker:
+        await owned.connect()
+        return owned
+
+    monkeypatch.setenv("TRADELAB_ALLOW_LIVE", "true")
+    manager = SessionManager(broker_factory=factory)
+    with pytest.raises(LiveTradingDisabledError, match="order updates"):
+        await manager.create(id="owned", symbol="A", mode="live", confirm_live=True)
+    assert owned.is_connected() is False
+
+    supplied = NoUpdatesBroker()
+    await supplied.connect()
+    with pytest.raises(LiveTradingDisabledError, match="order updates"):
+        await manager.create(
+            id="supplied",
+            symbol="A",
+            mode="live",
+            confirm_live=True,
+            broker=supplied,
+        )
+    assert supplied.is_connected() is True

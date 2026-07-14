@@ -161,6 +161,9 @@ class TradingSession:
                 raise LiveTradingDisabledError("live mode requires confirm_live=True")
             if isinstance(broker, PaperEngine):
                 raise LiveTradingDisabledError("live mode requires a credentialed broker")
+            supports_updates = getattr(broker, "supports_order_updates", None)
+            if not callable(supports_updates) or supports_updates() is not True:
+                raise LiveTradingDisabledError("live mode requires genuine streaming order updates")
         values = list(symbols) if symbols is not None else ([symbol] if symbol else [])
         cleaned = [str(value).strip() for value in values]
         if not cleaned or any(not value for value in cleaned):
@@ -184,12 +187,15 @@ class TradingSession:
         self.risk_manager = RiskManager(
             max_daily_loss_pct=max_daily_loss_pct,
             max_drawdown_pct=0,
+            max_position_pct=self.max_position_pct * 100,
             max_gross_exposure_pct=max_gross_exposure_pct,
             max_net_exposure_pct=max_net_exposure_pct,
         )
         self.running = False
         self.events: list[dict[str, Any]] = []
         self.brackets: dict[str, dict[str, str]] = {}
+        self._bracket_recoveries: dict[str, dict[str, str]] = {}
+        self._oco_winners: dict[str, dict[str, str]] = {}
         self._pending_brackets: dict[str, dict[str, Any]] = {}
         self._entry_meta: dict[str, dict[str, Any]] = {}
         self._leg_meta: dict[str, dict[str, Any]] = {}
@@ -246,29 +252,41 @@ class TradingSession:
     def _wire_broker_events(self) -> None:
         if self._wired:
             return
-        self._unsubscribers = [
-            self.broker.on(
-                "order:filled", lambda order: self._on_broker_fill(_order_payload(order))
-            ),
-            self.broker.on(
-                "order:submitted",
-                lambda order: self._record(
-                    "order:submitted", self._with_meta(_order_payload(order))
-                ),
-            ),
-            self.broker.on(
-                "order:canceled",
-                lambda order: self._on_terminal_order("order:canceled", _order_payload(order)),
-            ),
-            self.broker.on(
-                "order:rejected",
-                lambda order: self._on_terminal_order("order:rejected", _order_payload(order)),
-            ),
-            self.broker.on(
-                "equity:update",
-                lambda account: self._record("equity:update", _account_payload(account)),
-            ),
-        ]
+        try:
+            self._unsubscribers.append(
+                self.broker.on(
+                    "order:filled", lambda order: self._on_broker_fill(_order_payload(order))
+                )
+            )
+            self._unsubscribers.append(
+                self.broker.on(
+                    "order:submitted",
+                    lambda order: self._record(
+                        "order:submitted", self._with_meta(_order_payload(order))
+                    ),
+                )
+            )
+            self._unsubscribers.append(
+                self.broker.on(
+                    "order:canceled",
+                    lambda order: self._on_terminal_order("order:canceled", _order_payload(order)),
+                )
+            )
+            self._unsubscribers.append(
+                self.broker.on(
+                    "order:rejected",
+                    lambda order: self._on_terminal_order("order:rejected", _order_payload(order)),
+                )
+            )
+            self._unsubscribers.append(
+                self.broker.on(
+                    "equity:update",
+                    lambda account: self._record("equity:update", _account_payload(account)),
+                )
+            )
+        except BaseException:
+            self._unwire_broker_events()
+            raise
         self._wired = True
 
     def _unwire_broker_events(self) -> None:
@@ -353,17 +371,57 @@ class TradingSession:
                 if order_id == bracket.get("stopId")
                 else bracket.get("stopId")
             )
+            reason = "SL" if order_id == bracket.get("stopId") else "TP"
+            if symbol not in self._oco_winners:
+                self._oco_winners[symbol] = {
+                    "siblingId": str(sibling or ""),
+                    "winnerId": str(order_id or ""),
+                    "reason": reason,
+                }
+                self._record("position:closed", {"symbol": symbol, "reason": reason})
             if sibling:
-                if hasattr(self.broker, "cancel_order_nowait"):
-                    self.broker.cancel_order_nowait(sibling)
+                cancel_nowait = getattr(self.broker, "cancel_order_nowait", None)
+                if callable(cancel_nowait):
+                    try:
+                        cancel_nowait(sibling)
+                    except Exception as error:
+                        self._record(
+                            "error",
+                            {
+                                "symbol": symbol,
+                                "operation": "oco-cancel",
+                                "orderId": sibling,
+                                "message": str(error),
+                            },
+                        )
+                        raise
+                    else:
+                        self.brackets.pop(symbol, None)
+                        self._oco_winners.pop(symbol, None)
                 else:
-                    self._spawn(self.broker.cancel_order(sibling))
-            self.brackets.pop(symbol, None)
-            self._record(
-                "position:closed",
-                {"symbol": symbol, "reason": "SL" if order_id == bracket.get("stopId") else "TP"},
-            )
+                    self._spawn(self._cancel_oco_sibling(symbol, sibling))
+            else:
+                self.brackets.pop(symbol, None)
+                self._oco_winners.pop(symbol, None)
             return
+
+    async def _cancel_oco_sibling(self, symbol: str, order_id: str) -> None:
+        try:
+            await self.broker.cancel_order(order_id)
+        except Exception as error:
+            self._record(
+                "error",
+                {
+                    "symbol": symbol,
+                    "operation": "oco-cancel",
+                    "orderId": order_id,
+                    "message": str(error),
+                },
+            )
+            raise
+        else:
+            self.brackets.pop(symbol, None)
+            self._oco_winners.pop(symbol, None)
 
     async def start(self) -> dict[str, Any]:
         async with self._lifecycle_lock:
@@ -513,8 +571,13 @@ class TradingSession:
             )
             gross += abs(position_value)
             net += position_value if position.get("side") in {"long", "buy"} else -position_value
-        gate = self.risk_manager.check_exposure(
-            gross_exposure=gross, net_exposure=net, equity=self.equity
+        gate = self.risk_manager.can_open_position(
+            time_ms=self._clock_ms(),
+            position_count=len(positions),
+            position_value=abs(size * entry),
+            gross_exposure=gross,
+            net_exposure=net,
+            equity=self.equity,
         )
         if not gate["ok"]:
             raise RiskRejectedError(f"risk rejected: {gate['reason']}")
@@ -585,8 +648,10 @@ class TradingSession:
         if target_price is None and rr is not None and risk is not None:
             target_price = entry_fill + (1 if _broker_side(side) == "buy" else -1) * rr * risk
         bracket: dict[str, str] = {}
+        stop_client_id: str | None = None
         if stop is not None:
             client_id = self._next_client_id("stop")
+            stop_client_id = client_id
             if parent_entry_id:
                 self._leg_meta[client_id] = {"parentEntryId": parent_entry_id, "leg": "stop"}
             order = _order_payload(
@@ -606,18 +671,47 @@ class TradingSession:
             client_id = self._next_client_id("target")
             if parent_entry_id:
                 self._leg_meta[client_id] = {"parentEntryId": parent_entry_id, "leg": "target"}
-            order = _order_payload(
-                await self.broker.submit_order(
-                    {
-                        "symbol": symbol,
-                        "side": _opposite(side),
-                        "type": "limit",
-                        "qty": size,
-                        "limitPrice": target_price,
-                        "clientOrderId": client_id,
-                    }
+            try:
+                order = _order_payload(
+                    await self.broker.submit_order(
+                        {
+                            "symbol": symbol,
+                            "side": _opposite(side),
+                            "type": "limit",
+                            "qty": size,
+                            "limitPrice": target_price,
+                            "clientOrderId": client_id,
+                        }
+                    )
                 )
-            )
+            except BaseException:
+                stop_id = bracket.get("stopId")
+                if stop_id is not None:
+                    recovery = {"stopId": stop_id}
+                    if stop_client_id is not None:
+                        recovery["clientOrderId"] = stop_client_id
+                    self.brackets[symbol] = {"stopId": stop_id}
+                    self._bracket_recoveries[symbol] = dict(recovery)
+                    try:
+                        await asyncio.shield(self.broker.cancel_order(stop_id))
+                    except BaseException as compensation_error:
+                        reason = "bracket compensation failed; trading halted"
+                        self.risk_manager.halt(reason)
+                        self._record(
+                            "error",
+                            {
+                                "symbol": symbol,
+                                "operation": "bracket-compensation",
+                                "orderId": stop_id,
+                                "message": reason,
+                            },
+                        )
+                        self._record("risk:halt", {"reason": reason})
+                        raise RuntimeError(reason) from compensation_error
+                    else:
+                        self.brackets.pop(symbol, None)
+                        self._bracket_recoveries.pop(symbol, None)
+                raise
             bracket["targetId"] = str(order["orderId"])
         self.brackets[symbol] = bracket
 
@@ -644,6 +738,7 @@ class TradingSession:
         if position is None:
             return None
         bracket = self.brackets.pop(resolved, None)
+        self._bracket_recoveries.pop(resolved, None)
         if bracket:
             for order_id in bracket.values():
                 await self.broker.cancel_order(order_id)
@@ -669,6 +764,8 @@ class TradingSession:
             await self.broker.cancel_order(str(order["orderId"]))
         self._pending_brackets.clear()
         self.brackets.clear()
+        self._bracket_recoveries.clear()
+        self._oco_winners.clear()
         await self.refresh()
 
     async def cancel_order(self, order_id: str) -> None:
@@ -713,6 +810,39 @@ class TradingSession:
         self._cached_open_orders = [
             _order_payload(item) for item in await self.broker.get_open_orders()
         ]
+        open_ids = {str(order.get("orderId")) for order in self._cached_open_orders}
+        retried = False
+        for symbol, recovery in tuple(self._bracket_recoveries.items()):
+            stop_id = recovery.get("stopId")
+            if stop_id and stop_id in open_ids:
+                try:
+                    await self.broker.cancel_order(stop_id)
+                except Exception:
+                    self._record(
+                        "error",
+                        {
+                            "symbol": symbol,
+                            "operation": "bracket-compensation",
+                            "orderId": stop_id,
+                            "message": "bracket compensation retry failed",
+                        },
+                    )
+                    raise
+                retried = True
+            self.brackets.pop(symbol, None)
+            self._bracket_recoveries.pop(symbol, None)
+        for symbol, winner in tuple(self._oco_winners.items()):
+            sibling = winner.get("siblingId")
+            if sibling and sibling in open_ids:
+                await self._cancel_oco_sibling(symbol, sibling)
+                retried = True
+            else:
+                self.brackets.pop(symbol, None)
+                self._oco_winners.pop(symbol, None)
+        if retried:
+            self._cached_open_orders = [
+                _order_payload(item) for item in await self.broker.get_open_orders()
+            ]
         account = _account_payload(await self.broker.get_account())
         if account.get("equity") is not None:
             self.equity = _positive(account["equity"], "account.equity", allow_zero=True)
@@ -751,33 +881,41 @@ class SessionManager:
             if candidate_id in self.sessions:
                 raise ValidationError(f'session "{candidate_id}" already exists')
             resolved = broker
-            if mode == "live":
-                if not TradingSession.live_allowed() or confirm_live is not True:
-                    raise LiveTradingDisabledError(
-                        "live mode requires TRADELAB_ALLOW_LIVE=true and confirm_live=True"
-                    )
-                if resolved is None and self.broker_factory is not None:
-                    created = self.broker_factory({"symbol": symbol, **options})
-                    resolved = await created if inspect.isawaitable(created) else created
+            owned = False
+            try:
+                if mode == "live":
+                    if not TradingSession.live_allowed() or confirm_live is not True:
+                        raise LiveTradingDisabledError(
+                            "live mode requires TRADELAB_ALLOW_LIVE=true and confirm_live=True"
+                        )
+                    if resolved is None and self.broker_factory is not None:
+                        created = self.broker_factory({"symbol": symbol, **options})
+                        resolved = await created if inspect.isawaitable(created) else created
+                        owned = True
+                    if resolved is None:
+                        raise LiveTradingDisabledError("live mode requires a credentialed broker")
                 if resolved is None:
-                    raise LiveTradingDisabledError("live mode requires a credentialed broker")
-            if resolved is None:
-                resolved = PaperEngine(equity=equity)
-            session = cast(
-                TradingSession,
-                cast(Any, TradingSession)(
-                    id=candidate_id,
-                    symbol=symbol,
-                    symbols=symbols,
-                    interval=interval,
-                    broker=resolved,
-                    mode=mode,
-                    equity=equity,
-                    confirm_live=confirm_live,
-                    **options,
-                ),
-            )
-            await session.start()
+                    resolved = PaperEngine(equity=equity)
+                    owned = True
+                session = cast(
+                    TradingSession,
+                    cast(Any, TradingSession)(
+                        id=candidate_id,
+                        symbol=symbol,
+                        symbols=symbols,
+                        interval=interval,
+                        broker=resolved,
+                        mode=mode,
+                        equity=equity,
+                        confirm_live=confirm_live,
+                        **options,
+                    ),
+                )
+                await session.start()
+            except BaseException:
+                if owned and resolved is not None and resolved.is_connected():
+                    await resolved.disconnect()
+                raise
             self.sessions[session.id] = session
             return session
 
