@@ -134,6 +134,53 @@ async def test_accepted_exit_is_not_resubmitted_on_later_triggering_bars(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_synchronous_exit_rejection_without_event_halts_risk(tmp_path: Path) -> None:
+    class SilentRejectPaper(PaperEngine):
+        async def submit_order(self, order: Mapping[str, object]) -> dict[str, Any]:
+            return {
+                "orderId": "rejected-exit",
+                "clientOrderId": order["clientOrderId"],
+                "status": "rejected",
+                "symbol": order["symbol"],
+                "side": order["side"],
+                "type": order["type"],
+                "qty": order["qty"],
+                "filledQty": 0,
+                "rejectReason": "venue risk gate",
+            }
+
+    broker = SilentRejectPaper()
+    engine = LiveEngine(
+        id="rejected-exit",
+        symbol="A",
+        signal=lambda _context: None,
+        broker=broker,
+        storage=JsonFileStorage(base_dir=tmp_path),
+        warmup_bars=0,
+    )
+    await engine.start()
+    engine.open_position = {
+        "id": "trade-1",
+        "symbol": "A",
+        "side": "long",
+        "size": 1,
+        "entry": 100,
+        "entryFill": 100,
+        "stop": 98,
+        "takeProfit": 104,
+        "openTime": 1,
+        "_openedAtIndex": 0,
+    }
+
+    await engine.handle_bar(_bar(1_735_828_200_000, 98, high=99, low=97))
+
+    assert engine.risk_manager.halted is True
+    assert engine.risk_manager.halt_reason == "exit order rejected: venue risk gate"
+    assert engine.open_position["_pendingExitOrderId"] == "rejected-exit"
+    await engine.stop()
+
+
+@pytest.mark.asyncio
 async def test_start_failure_rolls_back_feed_broker_and_listeners(tmp_path: Path) -> None:
     class BrokenFeed(BrokerFeed):
         disconnected = False

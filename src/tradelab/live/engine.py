@@ -574,6 +574,14 @@ class LiveEngine:
         if self.open_position is not None:
             self.open_position["_pendingExitOrderId"] = receipt.get("orderId")
         await self._drain_event_tasks()
+        if receipt.get("status") == "rejected":
+            if not self.risk_manager.halted:
+                reason_text = str(receipt.get("rejectReason") or "broker rejected exit order")
+                reason = f"exit order rejected: {reason_text}"
+                self.risk_manager.halt(reason)
+                self._emit("risk:halt", {"symbol": self.symbol, "reason": reason})
+            await self._persist_state()
+            return
         if receipt.get("status") == "filled" and self.open_position is not None:
             self._on_order_filled(receipt)
             await self._drain_event_tasks()
