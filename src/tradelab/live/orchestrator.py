@@ -25,7 +25,12 @@ class RuntimeEngine(Protocol):
     event_bus: EventBus
     risk_manager: Any
 
-    async def start(self) -> None: ...
+    async def start(
+        self,
+        *,
+        disconnect_feed_on_failure: bool = True,
+        disconnect_broker_on_failure: bool = True,
+    ) -> None: ...
 
     async def stop(
         self,
@@ -133,6 +138,7 @@ class LiveOrchestrator:
                 account_equity = 0
             allocations = self._allocated_equities(account_equity or self.initial_equity)
             started: list[RuntimeEngine] = []
+            constructed: list[RuntimeEngine] = []
             try:
                 for index, system in enumerate(self.systems):
                     system_id = self._system_id(system, index)
@@ -159,17 +165,64 @@ class LiveOrchestrator:
                         equity=allocations[index],
                         use_broker_account_equity=False,
                     )
-                    await engine.start()
+                    constructed.append(engine)
+                    start_parameters = inspect.signature(engine.start).parameters
+                    if {
+                        "disconnect_feed_on_failure",
+                        "disconnect_broker_on_failure",
+                    }.issubset(start_parameters):
+                        await engine.start(
+                            disconnect_feed_on_failure=False,
+                            disconnect_broker_on_failure=False,
+                        )
+                    else:
+                        await engine.start()
                     started.append(engine)
                     self.engines.append(engine)
-            except BaseException:
+            except BaseException as start_error:
+                cleanup_failure: BaseException | None = None
                 for engine in reversed(started):
-                    await engine.stop()
+                    try:
+                        parameters = inspect.signature(engine.stop).parameters
+                        owns_transport_controls = {
+                            "flatten_on_shutdown",
+                            "disconnect_feed",
+                            "disconnect_broker",
+                        }.issubset(parameters)
+                        if owns_transport_controls:
+                            await engine.stop(
+                                flatten_on_shutdown=self.confirm_live,
+                                disconnect_feed=False,
+                                disconnect_broker=False,
+                            )
+                        else:
+                            await engine.stop()
+                    except BaseException as error:
+                        cleanup_failure = cleanup_failure or error
+                feeds: list[object] = []
+                for engine in constructed:
+                    feed = getattr(engine, "feed", None)
+                    if feed is not None and all(feed is not current for current in feeds):
+                        feeds.append(feed)
+                for feed in feeds:
+                    disconnect = getattr(feed, "disconnect", None)
+                    if callable(disconnect):
+                        try:
+                            await disconnect()
+                        except BaseException as error:
+                            cleanup_failure = cleanup_failure or error
+                if self.broker.is_connected():
+                    try:
+                        await self.broker.disconnect()
+                    except BaseException as error:
+                        cleanup_failure = cleanup_failure or error
                 self.engines.clear()
                 for unsubscribe in self._event_unsubscribers:
                     unsubscribe()
                 self._event_unsubscribers.clear()
-                raise
+                if cleanup_failure is not None:
+                    raise RuntimeError("orchestrator startup cleanup failed") from cleanup_failure
+                raise start_error
             self.running = True
             self.day_start_equity = float(self.get_status()["aggregateEquity"])
             self.current_day = day_key_et(self._now_ms())

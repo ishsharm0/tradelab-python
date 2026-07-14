@@ -728,7 +728,12 @@ class LiveEngine:
         for bar in sorted(bars, key=lambda item: _number(item.get("time"), -math.inf) or -math.inf):
             await self.handle_bar(bar)
 
-    async def start(self) -> None:
+    async def start(
+        self,
+        *,
+        disconnect_feed_on_failure: bool = True,
+        disconnect_broker_on_failure: bool = True,
+    ) -> None:
         async with self._lifecycle_lock:
             if self.running:
                 return
@@ -822,10 +827,15 @@ class LiveEngine:
                 self._emit("connected", {"symbol": self.symbol, "namespace": self.namespace})
                 await self._persist_state()
             except BaseException:
-                await self._rollback_start()
+                await self._rollback_start(
+                    disconnect_feed=disconnect_feed_on_failure,
+                    disconnect_broker=disconnect_broker_on_failure,
+                )
                 raise
 
-    async def _rollback_start(self) -> None:
+    async def _rollback_start(
+        self, *, disconnect_feed: bool = True, disconnect_broker: bool = True
+    ) -> None:
         self.running = self.connected = False
         for subscription in self.subscriptions:
             subscription.unsubscribe()
@@ -835,9 +845,10 @@ class LiveEngine:
         if callable(stop_polling):
             await _maybe_await(stop_polling())
         try:
-            await self.feed.disconnect()
+            if disconnect_feed:
+                await self.feed.disconnect()
         finally:
-            if self.broker.is_connected():
+            if disconnect_broker and self.broker.is_connected():
                 await self.broker.disconnect()
 
     async def stop(

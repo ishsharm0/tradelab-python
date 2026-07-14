@@ -116,6 +116,99 @@ async def test_orchestrator_rolls_back_started_engines_when_later_start_fails() 
     assert orchestrator.engines == []
 
 
+@pytest.mark.asyncio
+async def test_live_start_failure_flattens_started_system_before_shared_disconnect() -> None:
+    timeline: list[object] = []
+    broker = PaperEngine()
+
+    class FakeRisk:
+        def halt(self, _reason: str) -> None:
+            return None
+
+    class FakeEngine:
+        def __init__(
+            self,
+            *,
+            id: str,
+            fail: bool = False,
+            event_bus: object,
+            broker: PaperEngine,
+            **_options: object,
+        ) -> None:
+            self.id = id
+            self.fail = fail
+            self.event_bus = event_bus
+            self.broker = broker
+            self.feed = None
+            self.risk_manager = FakeRisk()
+
+        async def start(
+            self,
+            *,
+            disconnect_feed_on_failure: bool = True,
+            disconnect_broker_on_failure: bool = True,
+        ) -> None:
+            timeline.append(
+                (
+                    "start",
+                    self.id,
+                    disconnect_feed_on_failure,
+                    disconnect_broker_on_failure,
+                )
+            )
+            if not self.broker.is_connected():
+                await self.broker.connect()
+            if self.fail:
+                raise RuntimeError("second system failed")
+
+        async def stop(
+            self,
+            *,
+            flatten_on_shutdown: bool = False,
+            disconnect_feed: bool = True,
+            disconnect_broker: bool = True,
+        ) -> None:
+            timeline.append(
+                (
+                    "stop",
+                    self.id,
+                    flatten_on_shutdown,
+                    disconnect_feed,
+                    disconnect_broker,
+                    self.broker.is_connected(),
+                )
+            )
+
+        def get_status(self) -> dict[str, object]:
+            return {"id": self.id, "equity": 100, "openPosition": None}
+
+    orchestrator = LiveOrchestrator(
+        systems=[
+            {"id": "one", "symbol": "A", "signal": lambda _context: None},
+            {
+                "id": "two",
+                "symbol": "B",
+                "signal": lambda _context: None,
+                "fail": True,
+            },
+        ],
+        broker=broker,
+        confirm_live=True,
+        engine_factory=cast(Any, FakeEngine),
+    )
+
+    with pytest.raises(RuntimeError, match="second system failed"):
+        await orchestrator.start()
+
+    assert timeline == [
+        ("start", "one", False, False),
+        ("start", "two", False, False),
+        ("stop", "one", True, False, False, True),
+    ]
+    assert broker.is_connected() is False
+    assert orchestrator.engines == []
+
+
 def test_portfolio_daily_loss_halts_every_engine_once() -> None:
     orchestrator = LiveOrchestrator(
         systems=[{"id": "a", "symbol": "A", "signal": lambda _context: None}],

@@ -227,6 +227,42 @@ async def test_start_failure_rolls_back_feed_broker_and_listeners(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_owned_start_failure_preserves_shared_transport(tmp_path: Path) -> None:
+    class BrokenFeed(BrokerFeed):
+        disconnected = False
+
+        async def get_historical_bars(
+            self, symbol: str, interval: str, count: int
+        ) -> list[Mapping[str, object]]:
+            raise RuntimeError("history unavailable")
+
+        async def disconnect(self) -> None:
+            self.disconnected = True
+
+    broker = PaperEngine()
+    feed = BrokenFeed(broker=broker)
+    engine = LiveEngine(
+        id="shared-start-failure",
+        symbol="A",
+        signal=lambda _context: None,
+        broker=broker,
+        feed=feed,
+        storage=JsonFileStorage(base_dir=tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="history unavailable"):
+        await engine.start(
+            disconnect_feed_on_failure=False,
+            disconnect_broker_on_failure=False,
+        )
+
+    assert broker.is_connected() is True
+    assert feed.disconnected is False
+    assert engine.running is engine.connected is False
+    await broker.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_restart_mismatch_halts_risk_and_restores_state(tmp_path: Path) -> None:
     storage = JsonFileStorage(base_dir=tmp_path)
     await storage.save(
