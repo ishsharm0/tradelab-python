@@ -187,6 +187,9 @@ uv build
 uv run twine check dist/*
 ```
 
+Additional references: [architecture](docs/architecture.md), [API map](docs/api.md),
+[live safety](docs/safety.md), and [MCP tools](docs/mcp.md).
+
 The original JavaScript repository is used as an immutable parity oracle. Python adds
 stricter finite-number, path-containment, atomic-write, concurrency, and timezone safety
 where preserving a JavaScript defect would be dangerous.
