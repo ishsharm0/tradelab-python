@@ -23,7 +23,8 @@ Python 3.11 or newer is required.
 - Research statistics for Monte Carlo analysis, Deflated Sharpe, PBO, CPCV, and persistent
   hypothesis logs.
 - Self-contained JSON, CSV, Markdown, and offline HTML reports.
-- A 25-tool MCP server for research and paper/live session control.
+- A 25-tool MCP server for research and paper-session control, with an injectable,
+  fail-closed live broker boundary.
 - Strict typing, finite JSON outputs, and no implicit live-trading permission.
 
 ## Quick start
@@ -145,6 +146,7 @@ Paper mode needs no credentials. Live mode requires all three conditions:
 1. `TRADELAB_ALLOW_LIVE=true`
 2. `confirm_live=True`
 3. a connected, credentialed non-paper broker adapter
+4. genuine streamed order updates for fills, cancellations, and reconnects
 
 The process-level `halt_all()` operation flattens and stops every managed session.
 
@@ -157,6 +159,8 @@ tradelab walk-forward --source yahoo --symbol QQQ --period 2y
 tradelab run ema-cross --source yahoo --symbol SPY --params '{"fast": 8}'
 tradelab prefetch --symbol SPY --interval 1d --period 1y
 tradelab import-csv ./data/spy.csv --symbol SPY --interval 1d
+tradelab paper --csv-path ./data/spy.csv --symbol SPY --strategy ema-cross
+tradelab status --state-dir ./output/live-state
 ```
 
 `--strategy` accepts either a registered name or a local Python file. A strategy file defines
@@ -182,9 +186,12 @@ Run it with `tradelab backtest --source csv --csv-path bars.csv --strategy ./str
 }
 ```
 
-The server exposes research, robustness, persistent research-session, and paper/live
-session tools over stdio. Live session creation remains subject to the same environment,
-confirmation, and credential gates as the Python API.
+The server exposes research, robustness, persistent research-session, and paper-session
+tools over stdio. The default stdio graph intentionally has no live broker factory. Applications
+that inject a certified broker factory through `create_server(dependencies=...)` remain subject
+to the same environment, confirmation, credential, and streamed-order-update gates as the
+Python API. The bundled REST-only adapters fail closed for managed live protection until they
+gain authenticated reconnecting order streams.
 
 ## Development
 

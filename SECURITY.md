@@ -20,7 +20,7 @@ Paper mode is the default. Live session creation requires all of the following:
 
 1. `TRADELAB_ALLOW_LIVE=true` in the process environment.
 2. Explicit `confirm_live=True` authorization for that session.
-3. A connected, credentialed, non-paper broker adapter.
+3. A connected, credentialed, non-paper broker adapter with genuine streamed order updates.
 
 Treat broker credentials as secrets. Supply them at runtime, never commit them,
 and use restricted or testnet accounts while integrating an adapter. TradeLab does

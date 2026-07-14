@@ -56,6 +56,14 @@ script, or analytics endpoint.
 the process-local registry. Included strategies are `ema-cross`, `rsi-reversion`,
 `donchian-breakout`, and `buy-hold`.
 
+## Live runtime
+
+`tradelab.live` exports `PaperEngine`, `TradingSession`, `SessionManager`, `LiveEngine`,
+`LiveOrchestrator`, feed providers, candle aggregation, JSON storage, the authenticated
+loopback dashboard, and Alpaca/Binance/Coinbase/Interactive Brokers adapters. External adapters
+without authenticated reconnecting order streams are available for request mapping and data, but
+fail closed when asked to provide managed live protection.
+
 ## Error model
 
 All expected public failures derive from `TradeLabError`:

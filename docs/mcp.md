@@ -48,8 +48,11 @@ The server exposes 25 tools.
 - `attach_strategy`
 - `halt_all`
 
-Paper is the default. MCP live sessions cannot bypass `TRADELAB_ALLOW_LIVE=true`, explicit
-live confirmation, broker credentials, risk controls, or the process-level kill switch.
+Paper is the default. The bundled stdio server does not install a live broker factory; this keeps
+credentials out of tool arguments and prevents an uncertified REST adapter from being mistaken
+for a protected live connection. Programmatic servers may inject a factory, but live sessions
+still cannot bypass `TRADELAB_ALLOW_LIVE=true`, explicit confirmation, genuine streamed order
+updates, broker credentials, risk controls, or the cancellation-safe process kill switch.
 
 Tool results are encoded as strict JSON text. Expected failures are returned as MCP tool errors
 without tracebacks or credential material.

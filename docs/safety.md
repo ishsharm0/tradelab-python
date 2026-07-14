@@ -11,8 +11,10 @@ A live session requires:
 export TRADELAB_ALLOW_LIVE=true
 ```
 
-The caller must also pass `confirm_live=True` and provide a non-paper credentialed broker.
-Missing any condition raises `LiveTradingDisabledError` before the session starts.
+The caller must also pass `confirm_live=True` and provide a non-paper credentialed broker that
+advertises genuine streamed order updates. Missing any condition raises
+`LiveTradingDisabledError` before the session starts. REST-only adapters deliberately fail this
+gate because delayed fills could otherwise leave protective brackets inactive.
 
 ## Risk controls
 
