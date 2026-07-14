@@ -52,7 +52,7 @@ def _receipt(value: object, *, submitted: bool = False) -> OrderReceipt:
     row = as_mapping(value)
     average = optional_number(row.get("avgPrice"))
     time_value = row.get("transactTime" if submitted else "updateTime")
-    return {
+    receipt: OrderReceipt = {
         "orderId": str(row.get("orderId", "")),
         "clientOrderId": str(row["clientOrderId"])
         if row.get("clientOrderId") is not None
@@ -64,9 +64,16 @@ def _receipt(value: object, *, submitted: bool = False) -> OrderReceipt:
         "symbol": str(row.get("symbol", "")),
         "side": str(row.get("side", "")).lower(),
         "type": str(row.get("type", "")).lower(),
-        "qty": number(row.get("origQty")),
+        "qty": number(row.get("qty") if row.get("qty") is not None else row.get("origQty")),
         "rejectReason": str(row["rejectReason"]) if row.get("rejectReason") is not None else None,
     }
+    limit_price = optional_number(row.get("price"))
+    stop_price = optional_number(row.get("stopPrice"))
+    if limit_price is not None and limit_price > 0:
+        receipt["limitPrice"] = limit_price
+    if stop_price is not None and stop_price > 0:
+        receipt["stopPrice"] = stop_price
+    return receipt
 
 
 class BinanceBroker(BrokerAdapter):
@@ -87,6 +94,9 @@ class BinanceBroker(BrokerAdapter):
         self._api_secret = ""
         self._futures = False
         self._base_url = "https://api.binance.com"
+        self._quote_currency = "USDT"
+        self._order_symbols: dict[str, str] = {}
+        self._orders: dict[str, OrderReceipt] = {}
 
     async def connect(self, config: Mapping[str, object] | None = None) -> None:
         values = config or {}
@@ -95,6 +105,9 @@ class BinanceBroker(BrokerAdapter):
         if not self._api_key or not self._api_secret:
             raise ValidationError("Binance requires non-empty api_key and api_secret")
         self._futures = bool(option(values, "futures", default=False))
+        self._quote_currency = str(
+            option(values, "quote_currency", "quoteCurrency", default="USDT")
+        ).upper()
         paper = bool(option(values, "paper", default=False))
         if self._futures and paper:
             default_url = "https://testnet.binancefuture.com"
@@ -160,13 +173,22 @@ class BinanceBroker(BrokerAdapter):
                 "marginUsed": number(account.get("totalPositionInitialMargin")),
             }
         account = as_mapping(await self._request("GET", "/api/v3/account", signed=True))
-        free = sum(number(row.get("free")) for row in as_rows(account.get("balances")))
+        quote = next(
+            (
+                row
+                for row in as_rows(account.get("balances"))
+                if str(row.get("asset", "")).upper() == self._quote_currency
+            ),
+            {},
+        )
+        free = number(quote.get("free"))
+        locked = number(quote.get("locked"))
         return {
-            "equity": free,
+            "equity": free + locked,
             "buyingPower": free,
             "cash": free,
-            "currency": "USDT",
-            "marginUsed": 0.0,
+            "currency": self._quote_currency,
+            "marginUsed": locked,
         }
 
     async def get_positions(self) -> list[Position]:
@@ -188,27 +210,24 @@ class BinanceBroker(BrokerAdapter):
                     }
                 )
             return positions
-        account = as_mapping(await self._request("GET", "/api/v3/account", signed=True))
-        return [
-            {
-                "symbol": f"{row.get('asset', '')}USDT",
-                "side": "long",
-                "qty": number(row.get("free")),
-                "avgEntry": 0.0,
-                "marketValue": number(row.get("free")),
-                "unrealizedPnl": 0.0,
-            }
-            for row in as_rows(account.get("balances"))
-            if number(row.get("free")) > 0
-        ]
+        # Spot balances are assets, not valued positions. Without product metadata and a
+        # mark-price conversion, inventing ``ASSETUSDT`` symbols or USD values is unsafe.
+        await self._request("GET", "/api/v3/account", signed=True)
+        return []
 
     def _order_params(self, order: Mapping[str, object]) -> dict[str, object]:
         order_type = str(order.get("type") or "market").lower()
+        if order_type == "stop":
+            provider_type = "STOP_MARKET" if self._futures else "STOP_LOSS"
+        elif order_type == "stop_limit":
+            provider_type = "STOP" if self._futures else "STOP_LOSS_LIMIT"
+        else:
+            provider_type = order_type.upper()
         payload: dict[str, object] = {
             "symbol": order.get("symbol"),
             "side": str(order.get("side") or "").upper(),
             "quantity": str(order.get("qty")),
-            "type": "STOP_LOSS_LIMIT" if order_type == "stop_limit" else order_type.upper(),
+            "type": provider_type,
             "timeInForce": str(
                 option(order, "time_in_force", "timeInForce", default="GTC")
             ).upper(),
@@ -220,7 +239,9 @@ class BinanceBroker(BrokerAdapter):
             payload["price"] = str(limit_price)
         if stop_price is not None:
             payload["stopPrice"] = str(stop_price)
-        if payload["type"] == "MARKET":
+        if order_type in {"stop", "stop_limit"} and stop_price is None:
+            raise ValidationError("Binance stop orders require stop_price")
+        if payload["type"] in {"MARKET", "STOP_LOSS", "STOP_MARKET"}:
             payload.pop("timeInForce")
         return payload
 
@@ -228,38 +249,132 @@ class BinanceBroker(BrokerAdapter):
         path = self._path("/api/v3/order", "/fapi/v1/order")
         result = await self._request("POST", path, signed=True, params=self._order_params(order))
         receipt = _receipt(result, submitted=True)
+        if not receipt["symbol"]:
+            receipt["symbol"] = str(order.get("symbol") or "")
+        if receipt["orderId"] and receipt["symbol"]:
+            self._order_symbols[receipt["orderId"]] = receipt["symbol"]
+            self._orders[receipt["orderId"]] = receipt
         await self._emit("order:submitted", dict(receipt))
         return receipt
 
+    def _order_reference(
+        self, order_id: object, changes: Mapping[str, object] | None = None
+    ) -> tuple[str, str]:
+        if isinstance(order_id, Mapping):
+            raw_id = option(order_id, "order_id", "orderId")
+            raw_symbol = order_id.get("symbol")
+        else:
+            raw_id = order_id
+            raw_symbol = None
+        reference = str(raw_id or "").strip()
+        symbol = str(
+            raw_symbol or option(changes or {}, "symbol") or self._order_symbols.get(reference, "")
+        ).strip()
+        if not reference:
+            raise ValidationError("Binance order reference requires orderId")
+        if not symbol:
+            raise ValidationError(
+                "Binance order reference requires symbol; pass a receipt-like "
+                "{'orderId': ..., 'symbol': ...} value"
+            )
+        return reference, symbol
+
     async def cancel_order(self, order_id: object) -> None:
+        reference, symbol = self._order_reference(order_id)
         path = self._path("/api/v3/order", "/fapi/v1/order")
-        await self._request("DELETE", path, signed=True, params={"orderId": order_id})
-        await self._emit("order:canceled", {"orderId": str(order_id)})
+        await self._request(
+            "DELETE", path, signed=True, params={"symbol": symbol, "orderId": reference}
+        )
+        await self._emit("order:canceled", {"orderId": reference, "symbol": symbol})
 
     async def modify_order(self, order_id: object, changes: Mapping[str, object]) -> OrderReceipt:
-        path = self._path("/api/v3/order", "/fapi/v1/order")
+        reference, symbol = self._order_reference(order_id, changes)
+        supplied = order_id if isinstance(order_id, Mapping) else {}
+        current = self._orders.get(reference, _receipt(supplied))
+        quantity = option(changes, "qty", "quantity")
+        limit_price = option(changes, "limit_price", "limitPrice", "price")
+        stop_price = option(changes, "stop_price", "stopPrice")
+        if not self._futures:
+            if limit_price is not None or stop_price is not None:
+                raise ValidationError(
+                    "Binance spot keep-priority amendments cannot change order price"
+                )
+            if optional_number(quantity) is None or number(quantity) <= 0:
+                raise ValidationError("Binance spot amendments require a positive quantity")
+            path = "/api/v3/order/amend/keepPriority"
+            params: dict[str, object] = {
+                "symbol": symbol,
+                "orderId": reference,
+                "newQty": quantity,
+            }
+        else:
+            side = str(option(changes, "side", default=current.get("side", ""))).upper()
+            quantity = quantity if quantity is not None else current.get("qty")
+            limit_price = limit_price if limit_price is not None else current.get("limitPrice")
+            if side not in {"BUY", "SELL"}:
+                raise ValidationError("Binance futures modification requires order side")
+            if optional_number(quantity) is None or number(quantity) <= 0:
+                raise ValidationError("Binance futures modification requires positive quantity")
+            if optional_number(limit_price) is None or number(limit_price) <= 0:
+                raise ValidationError("Binance futures modification requires positive limit price")
+            if current.get("type") not in {"", "limit"}:
+                raise ValidationError("Binance futures only supports modifying limit orders")
+            path = "/fapi/v1/order"
+            params = {
+                "symbol": symbol,
+                "orderId": reference,
+                "side": side,
+                "quantity": quantity,
+                "price": limit_price,
+            }
         result = await self._request(
             "PUT",
             path,
             signed=True,
-            params={
-                "orderId": order_id,
-                "quantity": changes.get("qty"),
-                "price": option(changes, "limit_price", "limitPrice"),
-                "stopPrice": option(changes, "stop_price", "stopPrice"),
-            },
+            params=params,
         )
-        receipt = _receipt(result)
+        result_row = as_mapping(result)
+        receipt = _receipt(result_row.get("amendedOrder", result_row))
+        if not receipt["orderId"]:
+            receipt["orderId"] = reference
+        if not receipt["symbol"]:
+            receipt["symbol"] = symbol
+        if not receipt["side"]:
+            receipt["side"] = current.get("side", "")
+        if not receipt["type"]:
+            receipt["type"] = current.get("type", "")
+        if receipt["qty"] <= 0 and quantity is not None:
+            receipt["qty"] = number(quantity)
+        if "limitPrice" not in receipt and limit_price is not None:
+            receipt["limitPrice"] = number(limit_price)
+        if receipt["orderId"]:
+            self._order_symbols[receipt["orderId"]] = receipt["symbol"]
+            self._orders[receipt["orderId"]] = receipt
         await self._emit("order:modified", dict(receipt))
         return receipt
 
     async def get_open_orders(self) -> list[OrderReceipt]:
         path = self._path("/api/v3/openOrders", "/fapi/v1/openOrders")
-        return [_receipt(row) for row in as_rows(await self._request("GET", path, signed=True))]
+        receipts = [_receipt(row) for row in as_rows(await self._request("GET", path, signed=True))]
+        for receipt in receipts:
+            if receipt["orderId"] and receipt["symbol"]:
+                self._order_symbols[receipt["orderId"]] = receipt["symbol"]
+                self._orders[receipt["orderId"]] = receipt
+        return receipts
 
     async def get_order_status(self, order_id: object) -> OrderReceipt:
+        reference, symbol = self._order_reference(order_id)
         path = self._path("/api/v3/order", "/fapi/v1/order")
-        return _receipt(await self._request("GET", path, signed=True, params={"orderId": order_id}))
+        receipt = _receipt(
+            await self._request(
+                "GET", path, signed=True, params={"symbol": symbol, "orderId": reference}
+            )
+        )
+        if not receipt["symbol"]:
+            receipt["symbol"] = symbol
+        self._order_symbols[receipt["orderId"] or reference] = receipt["symbol"]
+        self._orders[receipt["orderId"] or reference] = receipt
+        return receipt
 
     async def get_historical_bars(
         self, symbol: str, interval: str, limit: int = 200

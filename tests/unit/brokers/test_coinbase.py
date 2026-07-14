@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import base64
-import hashlib
-import hmac
 import json
 
 import httpx
+import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 
 from tradelab.brokers import CoinbaseBroker
 from tradelab.errors import BrokerError, ValidationError
@@ -18,29 +19,25 @@ def _response(request: httpx.Request, payload: object = None, status: int = 200)
     return httpx.Response(status, json={} if payload is None else payload, request=request)
 
 
-def _b64(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+def _ec_key() -> ec.EllipticCurvePrivateKey:
+    return ec.derive_private_key(1, ec.SECP256R1())
 
 
-def _jwt(secret: str, method: str, path: str) -> str:
-    header = _b64(
-        json.dumps({"alg": "HS256", "typ": "JWT", "kid": "key"}, separators=(",", ":")).encode()
+def _ec_secret() -> str:
+    return (
+        _ec_key()
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+        .decode()
     )
-    payload = _b64(
-        json.dumps(
-            {
-                "iss": "cdp",
-                "sub": "key",
-                "nbf": 1_699_999_995,
-                "exp": 1_700_000_120,
-                "uri": f"{method} api.coinbase.com{path}",
-            },
-            separators=(",", ":"),
-        ).encode()
-    )
-    signing = f"{header}.{payload}"
-    signature = _b64(hmac.new(secret.encode(), signing.encode(), hashlib.sha256).digest())
-    return f"{signing}.{signature}"
+
+
+def _ed_secret() -> tuple[str, ed25519.Ed25519PrivateKey]:
+    raw = bytes(range(1, 33))
+    return base64.b64encode(raw).decode(), ed25519.Ed25519PrivateKey.from_private_bytes(raw)
 
 
 @pytest.mark.asyncio
@@ -67,36 +64,56 @@ async def test_coinbase_requires_credentials_and_builds_exact_jwt_for_paginated_
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        broker = CoinbaseBroker(client=client, clock=lambda: 1_700_000_000_000)
+        broker = CoinbaseBroker(
+            client=client,
+            clock=lambda: 1_700_000_000_000,
+            nonce_factory=lambda: "nonce-1",
+        )
         with pytest.raises(ValidationError, match=r"api_key.*api_secret"):
             await broker.connect({})
-        await broker.connect({"apiKey": "key", "apiSecret": "secret"})
+        await broker.connect({"apiKey": "key", "apiSecret": _ec_secret()})
         assert not broker.supports_paper_native()
         account = await broker.get_account()
 
     assert account == {
-        "equity": 5002.0,
-        "buyingPower": 5002.0,
-        "cash": 5002.0,
+        "equity": 5000.0,
+        "buyingPower": 5000.0,
+        "cash": 5000.0,
         "currency": "USD",
         "marginUsed": 0.0,
     }
     assert requests[0].url == "https://api.coinbase.com/api/v3/brokerage/accounts"
-    assert (
-        requests[0].headers["Authorization"]
-        == f"Bearer {_jwt('secret', 'GET', '/api/v3/brokerage/accounts')}"
-    )
+    token = requests[0].headers["Authorization"].removeprefix("Bearer ")
+    assert jwt.get_unverified_header(token) == {
+        "alg": "ES256",
+        "kid": "key",
+        "nonce": "nonce-1",
+        "typ": "JWT",
+    }
+    assert jwt.decode(
+        token,
+        _ec_key().public_key(),
+        algorithms=["ES256"],
+        options={"verify_exp": False, "verify_nbf": False},
+    ) == {
+        "iss": "cdp",
+        "sub": "key",
+        "nbf": 1_700_000_000,
+        "exp": 1_700_000_120,
+        "uri": "GET api.coinbase.com/api/v3/brokerage/accounts",
+    }
     assert dict(requests[1].url.params) == {"cursor": "next-account"}
 
 
 @pytest.mark.asyncio
-async def test_coinbase_positions_and_server_time_use_camel_normalization() -> None:
+async def test_coinbase_does_not_treat_unvalued_assets_as_usd_equity_or_fake_positions() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _response(
             request,
             {
                 "accounts": [
-                    {"currency": "BTC-USD", "available_balance": {"value": "2"}},
+                    {"currency": "USD", "available_balance": {"value": "500"}},
+                    {"currency": "BTC", "available_balance": {"value": "2"}},
                     {"currency": "EMPTY", "available_balance": {"value": "0"}},
                 ]
             },
@@ -104,18 +121,10 @@ async def test_coinbase_positions_and_server_time_use_camel_normalization() -> N
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         broker = CoinbaseBroker(client=client, clock=lambda: 123)
-        await broker.connect({"api_key": "key", "api_secret": "secret"})
+        await broker.connect({"api_key": "key", "api_secret": _ec_secret()})
         assert await broker.get_server_time() == 123
-        assert await broker.get_positions() == [
-            {
-                "symbol": "BTCUSD",
-                "side": "long",
-                "qty": 2.0,
-                "avgEntry": 0.0,
-                "marketValue": 2.0,
-                "unrealizedPnl": 0.0,
-            }
-        ]
+        assert (await broker.get_account())["equity"] == 500
+        assert await broker.get_positions() == []
 
 
 @pytest.mark.asyncio
@@ -165,7 +174,7 @@ async def test_coinbase_submit_order_configurations_and_receipt(
         broker = CoinbaseBroker(
             client=client, clock=lambda: 1_700_000_000_000, uuid_factory=lambda: "uuid-1"
         )
-        await broker.connect({"api_key": "key", "api_secret": "secret"})
+        await broker.connect({"api_key": "key", "api_secret": _ec_secret()})
         receipt = await broker.submit_order(
             {"symbol": "BTC-USD", "side": "buy", "type": order_type, "qty": 1, **prices}
         )
@@ -210,7 +219,7 @@ async def test_coinbase_cancel_edit_status_and_paginated_open_orders() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         broker = CoinbaseBroker(client=client, clock=lambda: 1)
-        await broker.connect({"api_key": "key", "api_secret": "secret"})
+        await broker.connect({"api_key": "key", "api_secret": _ec_secret()})
         await broker.cancel_order("oid-1")
         modified = await broker.modify_order("oid-1", {"qty": 0, "limitPrice": 0})
         opened = await broker.get_open_orders()
@@ -247,13 +256,22 @@ async def test_coinbase_candles_interval_conversion_and_provider_errors() -> Non
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        broker = CoinbaseBroker(client=client, clock=lambda: 1)
+        broker = CoinbaseBroker(client=client, clock=lambda: 1_700_000_000_000)
         await broker.connect(
-            {"api_key": "key", "api_secret": "secret", "baseUrl": "https://custom.coinbase/base"}
+            {
+                "api_key": "key",
+                "api_secret": _ec_secret(),
+                "baseUrl": "https://custom.coinbase/base",
+            }
         )
         bars = await broker.get_historical_bars("BTC-USD", "2h", 1)
     assert requests[0].url.path == "/base/products/BTC-USD/candles"
-    assert dict(requests[0].url.params) == {"granularity": "7200", "limit": "1"}
+    assert dict(requests[0].url.params) == {
+        "granularity": "TWO_HOUR",
+        "start": "1699992800",
+        "end": "1700000000",
+        "limit": "1",
+    }
     assert bars[0]["time"] == 1_735_828_200_000
 
     async with httpx.AsyncClient(
@@ -262,6 +280,41 @@ async def test_coinbase_candles_interval_conversion_and_provider_errors() -> Non
         )
     ) as client:
         broker = CoinbaseBroker(client=client, clock=lambda: 1)
-        await broker.connect({"api_key": "key", "api_secret": "secret"})
+        await broker.connect({"api_key": "key", "api_secret": _ec_secret()})
         with pytest.raises(BrokerError, match="denied"):
             await broker.get_account()
+
+
+@pytest.mark.asyncio
+async def test_coinbase_supports_raw_ed25519_keys_and_rejects_200_error_envelopes() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _response(
+            request,
+            {"success": False, "error_response": {"message": "order rejected"}},
+        )
+
+    secret, private_key = _ed_secret()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        broker = CoinbaseBroker(
+            client=client,
+            clock=lambda: 1_700_000_000_000,
+            nonce_factory=lambda: "nonce-ed",
+        )
+        await broker.connect({"api_key": "key", "api_secret": secret})
+        with pytest.raises(BrokerError, match="order rejected"):
+            await broker.cancel_order("oid-1")
+
+    token = requests[0].headers["Authorization"].removeprefix("Bearer ")
+    assert jwt.get_unverified_header(token)["alg"] == "EdDSA"
+    assert (
+        jwt.decode(
+            token,
+            private_key.public_key(),
+            algorithms=["EdDSA"],
+            options={"verify_exp": False, "verify_nbf": False},
+        )["uri"]
+        == "POST api.coinbase.com/api/v3/brokerage/orders/batch_cancel"
+    )

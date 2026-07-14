@@ -191,7 +191,24 @@ class BrokerAdapter(ABC):
     def supports_paper_native(self) -> bool:
         return False
 
+    def supports_order_updates(self) -> bool:
+        """Return whether fills/cancellations are streamed without polling gaps.
+
+        REST-only adapters deliberately return ``False``. Managed live sessions depend on
+        terminal order events for bracket/OCO safety and must fail closed until an adapter
+        implements a reconnecting authenticated order-update stream.
+        """
+        return False
+
     def on(self, event: str, handler: EventHandler) -> Unsubscribe:
+        if (
+            event in {"order:filled", "order:canceled", "order:rejected"}
+            and not self.supports_order_updates()
+        ):
+            raise BrokerError(
+                f"{self.broker_name} does not provide live order updates; "
+                "managed live protection is unavailable"
+            )
         self._events.setdefault(event, []).append(handler)
 
         def unsubscribe() -> None:

@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import base64
-import hashlib
-import hmac
-import json
-import re
+import binascii
+import secrets
 import uuid
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
@@ -14,9 +12,12 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 import httpx
+import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 
 from tradelab.data import normalize_candles
-from tradelab.errors import ValidationError
+from tradelab.errors import BrokerError, ValidationError
 
 from .base import (
     Account,
@@ -32,16 +33,43 @@ from .base import (
     system_clock_ms,
 )
 
-JwtSigner = Callable[[str, str], str]
 UuidFactory = Callable[[], str]
+NonceFactory = Callable[[], str]
+PrivateKey = ec.EllipticCurvePrivateKey | ed25519.Ed25519PrivateKey
+JwtSigner = Callable[[Mapping[str, object], PrivateKey, str, Mapping[str, object]], str]
 
 
-def _b64(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+def _sign(
+    payload: Mapping[str, object],
+    private_key: PrivateKey,
+    algorithm: str,
+    headers: Mapping[str, object],
+) -> str:
+    return jwt.encode(dict(payload), private_key, algorithm=algorithm, headers=dict(headers))
 
 
-def _sign(secret: str, payload: str) -> str:
-    return _b64(hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest())
+def _private_key(secret: str) -> tuple[PrivateKey, str]:
+    value = secret.replace("\\n", "\n") if "-----BEGIN" in secret else secret
+    if value.lstrip().startswith("-----BEGIN"):
+        try:
+            key = serialization.load_pem_private_key(value.encode(), password=None)
+        except (TypeError, ValueError) as error:
+            raise ValidationError("Coinbase api_secret is not a valid private key") from error
+    else:
+        try:
+            raw = base64.b64decode("".join(value.split()), validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValidationError(
+                "Coinbase api_secret must be an EC/Ed25519 PEM or base64 Ed25519 key"
+            ) from error
+        if len(raw) not in {32, 64}:
+            raise ValidationError("Coinbase Ed25519 api_secret must decode to 32 or 64 bytes")
+        key = ed25519.Ed25519PrivateKey.from_private_bytes(raw[:32])
+    if isinstance(key, ed25519.Ed25519PrivateKey):
+        return key, "EdDSA"
+    if isinstance(key, ec.EllipticCurvePrivateKey) and isinstance(key.curve, ec.SECP256R1):
+        return key, "ES256"
+    raise ValidationError("Coinbase api_secret must use P-256 ECDSA or Ed25519")
 
 
 def _time_ms(value: object) -> int | None:
@@ -100,12 +128,17 @@ class CoinbaseBroker(BrokerAdapter):
         clock: Clock = system_clock_ms,
         signer: JwtSigner = _sign,
         uuid_factory: UuidFactory = lambda: str(uuid.uuid4()),
+        nonce_factory: NonceFactory = secrets.token_hex,
     ) -> None:
         super().__init__(client=client, clock=clock)
         self._signer = signer
         self._uuid_factory = uuid_factory
+        self._nonce_factory = nonce_factory
         self._api_key = ""
         self._api_secret = ""
+        self._private_key: PrivateKey | None = None
+        self._algorithm = ""
+        self._quote_currency = "USD"
         self._base_url = "https://api.coinbase.com/api/v3/brokerage"
 
     async def connect(self, config: Mapping[str, object] | None = None) -> None:
@@ -114,6 +147,10 @@ class CoinbaseBroker(BrokerAdapter):
         self._api_secret = str(option(values, "api_secret", "apiSecret", default="") or "").strip()
         if not self._api_key or not self._api_secret:
             raise ValidationError("Coinbase requires non-empty api_key and api_secret")
+        self._private_key, self._algorithm = _private_key(self._api_secret)
+        self._quote_currency = str(
+            option(values, "quote_currency", "quoteCurrency", default="USD")
+        ).upper()
         self._base_url = str(
             option(
                 values,
@@ -127,26 +164,20 @@ class CoinbaseBroker(BrokerAdapter):
     def _jwt(self, method: str, url: str) -> str:
         target = urlsplit(url)
         now = self._clock() // 1_000
-        header = _b64(
-            json.dumps(
-                {"alg": "HS256", "typ": "JWT", "kid": self._api_key},
-                separators=(",", ":"),
-            ).encode()
+        if self._private_key is None:
+            raise BrokerError("Coinbase broker is not authenticated")
+        return self._signer(
+            {
+                "iss": "cdp",
+                "sub": self._api_key,
+                "nbf": now,
+                "exp": now + 120,
+                "uri": f"{method.upper()} {target.netloc}{target.path}",
+            },
+            self._private_key,
+            self._algorithm,
+            {"kid": self._api_key, "nonce": self._nonce_factory()},
         )
-        payload = _b64(
-            json.dumps(
-                {
-                    "iss": "cdp",
-                    "sub": self._api_key,
-                    "nbf": now - 5,
-                    "exp": now + 120,
-                    "uri": f"{method.upper()} {target.netloc}{target.path}",
-                },
-                separators=(",", ":"),
-            ).encode()
-        )
-        signing_input = f"{header}.{payload}"
-        return f"{signing_input}.{self._signer(self._api_secret, signing_input)}"
 
     async def _request(
         self,
@@ -157,7 +188,7 @@ class CoinbaseBroker(BrokerAdapter):
         body: object = None,
     ) -> object:
         url = f"{self._base_url}{path}"
-        return await self._request_json(
+        response = await self._request_json(
             method,
             url,
             headers={
@@ -167,6 +198,14 @@ class CoinbaseBroker(BrokerAdapter):
             params=params,
             json=body,
         )
+        envelope = as_mapping(response)
+        error = as_mapping(envelope.get("error_response"))
+        if envelope.get("success") is False or error:
+            message = str(error.get("message") or error.get("error") or "Coinbase request failed")
+            raise BrokerError(
+                message, context={"broker": self.broker_name, "method": method, "path": path}
+            )
+        return response
 
     async def _pages(
         self,
@@ -193,35 +232,45 @@ class CoinbaseBroker(BrokerAdapter):
 
     async def get_account(self) -> Account:
         accounts = await self._pages("/accounts", "accounts")
-        equity = sum(
-            number(row.get("available_balance", {}).get("value"))
-            if isinstance(row.get("available_balance"), Mapping)
-            else 0.0
-            for row in accounts
+        quote = next(
+            (
+                row
+                for row in accounts
+                if str(row.get("currency", "")).upper() == self._quote_currency
+            ),
+            {},
         )
+        available = quote.get("available_balance")
+        hold = quote.get("hold")
+        cash = number(available.get("value")) if isinstance(available, Mapping) else 0.0
+        held = number(hold.get("value")) if isinstance(hold, Mapping) else 0.0
         return {
-            "equity": equity,
-            "buyingPower": equity,
-            "cash": equity,
-            "currency": "USD",
-            "marginUsed": 0.0,
+            "equity": cash + held,
+            "buyingPower": cash,
+            "cash": cash,
+            "currency": self._quote_currency,
+            "marginUsed": held,
         }
 
     async def get_positions(self) -> list[Position]:
         positions: list[Position] = []
         for row in await self._pages("/accounts", "accounts"):
+            product_id = row.get("product_id")
+            market_value = row.get("market_value")
+            if not isinstance(product_id, str) or not product_id or market_value is None:
+                continue
             balance = row.get("available_balance")
             qty = number(balance.get("value")) if isinstance(balance, Mapping) else 0.0
             if qty <= 0:
                 continue
             positions.append(
                 {
-                    "symbol": str(row.get("currency", "")).replace("-", ""),
+                    "symbol": product_id,
                     "side": "long",
                     "qty": qty,
                     "avgEntry": 0.0,
-                    "marketValue": qty,
-                    "unrealizedPnl": 0.0,
+                    "marketValue": number(market_value),
+                    "unrealizedPnl": number(row.get("unrealized_pnl")),
                 }
             )
         return positions
@@ -302,20 +351,40 @@ class CoinbaseBroker(BrokerAdapter):
         return _receipt(response.get("order"), fallback_id=order_id)
 
     @staticmethod
-    def _granularity(interval: object) -> int:
-        match = re.fullmatch(r"(\d+)(m|h|d)", str(interval or "1m").lower())
-        if match is None:
-            return 60
-        factor = {"m": 60, "h": 3_600, "d": 86_400}[match.group(2)]
-        return int(match.group(1)) * factor
+    def _granularity(interval: object) -> tuple[str, int]:
+        values = {
+            "1m": ("ONE_MINUTE", 60),
+            "5m": ("FIVE_MINUTE", 300),
+            "15m": ("FIFTEEN_MINUTE", 900),
+            "30m": ("THIRTY_MINUTE", 1_800),
+            "1h": ("ONE_HOUR", 3_600),
+            "2h": ("TWO_HOUR", 7_200),
+            "4h": ("FOUR_HOUR", 14_400),
+            "6h": ("SIX_HOUR", 21_600),
+            "1d": ("ONE_DAY", 86_400),
+        }
+        normalized = str(interval or "1m").lower()
+        if normalized not in values:
+            raise ValidationError(f'Unsupported Coinbase candle interval "{normalized}"')
+        return values[normalized]
 
     async def get_historical_bars(
         self, symbol: str, interval: str, limit: int = 200
     ) -> list[dict[str, int | float]]:
+        if limit <= 0 or limit > 350:
+            raise ValidationError("Coinbase candle limit must be between 1 and 350")
+        granularity, seconds = self._granularity(interval)
+        end = self._clock() // 1_000
+        start = end - seconds * limit
         payload = await self._request(
             "GET",
             f"/products/{quote(symbol, safe='')}/candles",
-            params={"granularity": self._granularity(interval), "limit": limit},
+            params={
+                "granularity": granularity,
+                "start": start,
+                "end": end,
+                "limit": limit,
+            },
         )
         mapping = as_mapping(payload)
         rows: object = mapping.get("candles") if mapping else payload
@@ -354,6 +423,7 @@ def create_coinbase_broker(
     clock: Clock = system_clock_ms,
     signer: JwtSigner = _sign,
     uuid_factory: UuidFactory = lambda: str(uuid.uuid4()),
+    nonce_factory: NonceFactory = secrets.token_hex,
 ) -> CoinbaseBroker:
     """Create a Coinbase adapter from constructor options."""
     return CoinbaseBroker(
@@ -361,6 +431,7 @@ def create_coinbase_broker(
         clock=clock,
         signer=signer,
         uuid_factory=uuid_factory,
+        nonce_factory=nonce_factory,
     )
 
 

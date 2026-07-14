@@ -15,6 +15,7 @@ from tradelab.brokers import (
     create_coinbase_broker,
     create_interactive_brokers_broker,
 )
+from tradelab.errors import BrokerError
 from tradelab.live import SessionBroker, TradingSession
 
 
@@ -27,6 +28,7 @@ def test_all_brokers_satisfy_live_session_protocol_without_optional_imports() ->
     ]
     assert all(isinstance(broker, SessionBroker) for broker in brokers)
     for broker in brokers:
+        assert broker.supports_order_updates() is False
         session = TradingSession(symbol="AAPL", broker=broker)
         assert session.broker is broker
 
@@ -39,7 +41,7 @@ def test_provider_factories_return_fresh_typed_adapters() -> None:
 
 
 @pytest.mark.asyncio
-async def test_alpaca_runs_through_real_trading_session_lifecycle() -> None:
+async def test_rest_broker_fails_closed_when_session_requires_fill_updates() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v2/account":
             payload: object = {"equity": "10000", "buying_power": "8000", "cash": "5000"}
@@ -53,9 +55,8 @@ async def test_alpaca_runs_through_real_trading_session_lifecycle() -> None:
         broker = AlpacaBroker(client=client)
         await broker.connect({"api_key": "key", "api_secret": "secret", "paper": True})
         session = TradingSession(symbol="AAPL", broker=broker)
-        status = await session.start()
-        assert status["running"] is True
-        assert session.equity == 10_000
-        await session.stop()
+        with pytest.raises(BrokerError, match="live order updates"):
+            await session.start()
+        await broker.disconnect()
         assert not broker.is_connected()
         assert not client.is_closed

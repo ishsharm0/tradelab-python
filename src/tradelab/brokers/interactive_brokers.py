@@ -9,7 +9,7 @@ import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from types import ModuleType
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from tradelab.data import normalize_candles
 from tradelab.errors import BrokerError, ValidationError
@@ -28,6 +28,7 @@ from .base import (
 Factory = Callable[[], object]
 ModuleLoader = Callable[[str], object]
 ContractFactory = Callable[[str, str, str], object]
+OrderFactory = Callable[..., object]
 
 
 class _IBModule(Protocol):
@@ -73,16 +74,17 @@ class InteractiveBrokersBroker(BrokerAdapter):
         ib_factory: Factory | None = None,
         module_loader: ModuleLoader = importlib.import_module,
         contract_factory: ContractFactory | None = None,
+        order_factory: OrderFactory | None = None,
         clock: Clock = system_clock_ms,
     ) -> None:
         super().__init__(clock=clock)
         self._ib_factory = ib_factory
         self._module_loader = module_loader
         self._contract_factory = contract_factory
+        self._order_factory = order_factory
         self._ib: object | None = None
         self._module: ModuleType | object | None = None
-        self._order_counter = 1
-        self._orders: dict[str, OrderReceipt] = {}
+        self._trades: dict[str, object] = {}
 
     def supports_paper_native(self) -> bool:
         return True
@@ -110,20 +112,24 @@ class InteractiveBrokersBroker(BrokerAdapter):
             factory = self._ib_factory
         self._ib = factory()
         connector = getattr(self._ib, "connectAsync", None)
-        if callable(connector):
-            try:
-                await _resolve(
-                    connector(
-                        host,
-                        port_value,
-                        clientId=client_value,
-                        timeout=number(option(values, "timeout", default=4.0), 4.0),
-                        readonly=bool(option(values, "readonly", default=False)),
-                    )
+        if not callable(connector):
+            connector = getattr(self._ib, "connect", None)
+        if not callable(connector):
+            self._ib = None
+            raise BrokerError("Interactive Brokers client does not provide connect")
+        try:
+            await _resolve(
+                connector(
+                    host,
+                    port_value,
+                    clientId=client_value,
+                    timeout=number(option(values, "timeout", default=4.0), 4.0),
+                    readonly=bool(option(values, "readonly", default=False)),
                 )
-            except Exception as error:
-                self._ib = None
-                raise BrokerError(f"Interactive Brokers connection failed: {error}") from error
+            )
+        except Exception as error:
+            self._ib = None
+            raise BrokerError(f"Interactive Brokers connection failed: {error}") from error
         self._connected = True
 
     async def disconnect(self) -> None:
@@ -184,69 +190,184 @@ class InteractiveBrokersBroker(BrokerAdapter):
         return positions
 
     async def submit_order(self, order: Mapping[str, object]) -> OrderReceipt:
-        self._require_ib()
-        order_id = str(self._order_counter)
-        self._order_counter += 1
-        receipt: OrderReceipt = {
-            "orderId": order_id,
-            "clientOrderId": str(option(order, "client_order_id", "clientOrderId"))
-            if option(order, "client_order_id", "clientOrderId") is not None
-            else None,
-            "status": "new",
-            "filledQty": 0.0,
-            "avgFillPrice": None,
-            "filledAt": None,
-            "symbol": str(order.get("symbol", "")),
-            "side": str(order.get("side", "")).lower(),
-            "type": str(order.get("type", "")).lower(),
-            "qty": number(order.get("qty")),
-        }
-        limit = option(order, "limit_price", "limitPrice")
-        stop = option(order, "stop_price", "stopPrice")
-        if limit is not None:
-            receipt["limitPrice"] = number(limit)
-        if stop is not None:
-            receipt["stopPrice"] = number(stop)
-        self._orders[order_id] = receipt
+        ib = self._require_ib()
+        symbol = str(order.get("symbol") or "").strip()
+        if not symbol:
+            raise ValidationError("Interactive Brokers order requires a symbol")
+        contract = await self._qualified_contract(symbol)
+        ib_order = self._create_order(order)
+        place = getattr(ib, "placeOrder", None)
+        if not callable(place):
+            raise BrokerError("Interactive Brokers client does not provide placeOrder")
+        trade = await _resolve(place(contract, ib_order))
+        receipt = self._trade_receipt(trade, fallback_contract=contract, fallback_order=ib_order)
+        if not receipt["orderId"]:
+            raise BrokerError("Interactive Brokers did not assign an order id")
+        self._trades[receipt["orderId"]] = trade
         await self._emit("order:submitted", dict(receipt))
-        return cast(OrderReceipt, dict(receipt))
+        return receipt
 
     async def cancel_order(self, order_id: object) -> None:
-        receipt = self._orders.get(str(order_id))
-        if receipt is None:
+        reference = str(order_id)
+        trade = self._trades.get(reference)
+        if trade is None:
             return
-        receipt["status"] = "canceled"
+        ib = self._require_ib()
+        cancel = getattr(ib, "cancelOrder", None)
+        if not callable(cancel):
+            raise BrokerError("Interactive Brokers client does not provide cancelOrder")
+        order = _attribute(trade, "order")
+        result = await _resolve(cancel(order))
+        if result is not None:
+            trade = result
+            self._trades[reference] = trade
+        receipt = self._trade_receipt(trade)
         await self._emit("order:canceled", dict(receipt))
 
     async def modify_order(self, order_id: object, changes: Mapping[str, object]) -> OrderReceipt:
-        receipt = self._orders.get(str(order_id))
-        if receipt is None:
+        reference = str(order_id)
+        trade = self._trades.get(reference)
+        if trade is None:
             raise BrokerError(f'IB order "{order_id}" not found')
+        ib = self._require_ib()
+        contract = _attribute(trade, "contract")
+        order = _attribute(trade, "order")
+        mutable_order = cast(Any, order)
         if changes.get("qty") is not None:
-            receipt["qty"] = number(changes["qty"], receipt["qty"])
-        for aliases, target in (
-            (("limit_price", "limitPrice"), "limitPrice"),
-            (("stop_price", "stopPrice"), "stopPrice"),
-        ):
-            value = option(changes, *aliases)
-            if value is not None:
-                if target == "limitPrice":
-                    receipt["limitPrice"] = number(value)
-                else:
-                    receipt["stopPrice"] = number(value)
+            mutable_order.totalQuantity = number(changes["qty"])
+        limit = option(changes, "limit_price", "limitPrice")
+        stop = option(changes, "stop_price", "stopPrice")
+        if limit is not None:
+            mutable_order.lmtPrice = number(limit)
+        if stop is not None:
+            mutable_order.auxPrice = number(stop)
+            if str(_attribute(order, "orderType", "")).upper() == "LMT":
+                mutable_order.orderType = "STP LMT"
+        place = getattr(ib, "placeOrder", None)
+        if not callable(place):
+            raise BrokerError("Interactive Brokers client does not provide placeOrder")
+        updated = await _resolve(place(contract, order))
+        if updated is not None:
+            trade = updated
+            self._trades[reference] = trade
+        receipt = self._trade_receipt(trade)
         await self._emit("order:modified", dict(receipt))
-        return cast(OrderReceipt, dict(receipt))
+        return receipt
 
     async def get_open_orders(self) -> list[OrderReceipt]:
-        return [
-            cast(OrderReceipt, dict(row)) for row in self._orders.values() if row["status"] == "new"
-        ]
+        ib = self._require_ib()
+        method = getattr(ib, "openTrades", None)
+        values = await _resolve(method()) if callable(method) else list(self._trades.values())
+        trades = values if isinstance(values, list) else []
+        receipts = [self._trade_receipt(trade) for trade in trades]
+        for trade, receipt in zip(trades, receipts, strict=True):
+            if receipt["orderId"]:
+                self._trades[receipt["orderId"]] = trade
+        return [receipt for receipt in receipts if receipt["status"] in {"new", "partially_filled"}]
 
     async def get_order_status(self, order_id: object) -> OrderReceipt:
-        receipt = self._orders.get(str(order_id))
-        if receipt is None:
+        trade = self._trades.get(str(order_id))
+        if trade is None:
             raise BrokerError(f'IB order "{order_id}" not found')
-        return cast(OrderReceipt, dict(receipt))
+        return self._trade_receipt(trade)
+
+    async def _qualified_contract(self, symbol: str) -> object:
+        ib = self._require_ib()
+        contract = self._contract(symbol)
+        qualify = getattr(ib, "qualifyContractsAsync", None)
+        if not callable(qualify):
+            qualify = getattr(ib, "qualifyContracts", None)
+        if not callable(qualify):
+            raise BrokerError("Interactive Brokers client does not provide qualifyContracts")
+        values = await _resolve(qualify(contract))
+        if not isinstance(values, (list, tuple)) or not values:
+            raise BrokerError(f'Interactive Brokers could not qualify contract "{symbol}"')
+        return values[0]
+
+    def _create_order(self, order: Mapping[str, object]) -> object:
+        factory = self._order_factory
+        if factory is None and self._module is not None:
+            candidate = getattr(self._module, "Order", None)
+            factory = candidate if callable(candidate) else None
+        if factory is None:
+            raise BrokerError("Interactive Brokers order factory is unavailable")
+        kind = str(order.get("type") or "market").lower()
+        order_type = {
+            "market": "MKT",
+            "limit": "LMT",
+            "stop": "STP",
+            "stop_limit": "STP LMT",
+        }.get(kind)
+        if order_type is None:
+            raise ValidationError(f'Unsupported Interactive Brokers order type "{kind}"')
+        values: dict[str, object] = {
+            "action": str(order.get("side") or "").upper(),
+            "totalQuantity": number(order.get("qty")),
+            "orderType": order_type,
+            "tif": str(option(order, "time_in_force", "timeInForce", default="GTC")).upper(),
+            "transmit": True,
+        }
+        client_id = option(order, "client_order_id", "clientOrderId")
+        if client_id is not None:
+            values["orderRef"] = str(client_id)
+        limit = option(order, "limit_price", "limitPrice")
+        stop = option(order, "stop_price", "stopPrice")
+        if limit is not None:
+            values["lmtPrice"] = number(limit)
+        if stop is not None:
+            values["auxPrice"] = number(stop)
+        return factory(**values)
+
+    @staticmethod
+    def _trade_receipt(
+        trade: object, *, fallback_contract: object = None, fallback_order: object = None
+    ) -> OrderReceipt:
+        contract = _attribute(trade, "contract", fallback_contract)
+        order = _attribute(trade, "order", fallback_order)
+        status = _attribute(trade, "orderStatus", {})
+        normalized_status = str(_attribute(status, "status", "")).upper().replace("_", "")
+        state = {
+            "FILLED": "filled",
+            "CANCELLED": "canceled",
+            "APICANCELLED": "canceled",
+            "INACTIVE": "rejected",
+            "PARTIALLYFILLED": "partially_filled",
+        }.get(normalized_status, "new")
+        filled = number(_attribute(status, "filled"))
+        total = number(_attribute(order, "totalQuantity"))
+        if state == "new" and 0 < filled < total:
+            state = "partially_filled"
+        fills = _attribute(trade, "fills", [])
+        fill_rows = fills if isinstance(fills, list) else []
+        execution = _attribute(fill_rows[-1], "execution") if fill_rows else None
+        filled_at = _time_ms(_attribute(execution, "time"))
+        average = number(_attribute(status, "avgFillPrice"))
+        receipt: OrderReceipt = {
+            "orderId": str(_attribute(order, "orderId", _attribute(order, "permId", "")) or ""),
+            "clientOrderId": str(_attribute(order, "orderRef"))
+            if _attribute(order, "orderRef") not in {None, ""}
+            else None,
+            "status": state,
+            "filledQty": filled,
+            "avgFillPrice": average if average > 0 else None,
+            "filledAt": filled_at,
+            "symbol": str(_attribute(contract, "symbol", "")),
+            "side": str(_attribute(order, "action", "")).lower(),
+            "type": {
+                "MKT": "market",
+                "LMT": "limit",
+                "STP": "stop",
+                "STP LMT": "stop_limit",
+            }.get(str(_attribute(order, "orderType", "")).upper(), "unknown"),
+            "qty": total,
+        }
+        limit = number(_attribute(order, "lmtPrice"))
+        stop = number(_attribute(order, "auxPrice"))
+        if limit > 0:
+            receipt["limitPrice"] = limit
+        if stop > 0:
+            receipt["stopPrice"] = stop
+        return receipt
 
     def _contract(self, symbol: str) -> object:
         factory = self._contract_factory
@@ -316,6 +437,7 @@ def create_interactive_brokers_broker(
     ib_factory: Factory | None = None,
     module_loader: ModuleLoader = importlib.import_module,
     contract_factory: ContractFactory | None = None,
+    order_factory: OrderFactory | None = None,
     clock: Clock = system_clock_ms,
 ) -> InteractiveBrokersBroker:
     """Create an Interactive Brokers adapter from constructor options."""
@@ -323,6 +445,7 @@ def create_interactive_brokers_broker(
         ib_factory=ib_factory,
         module_loader=module_loader,
         contract_factory=contract_factory,
+        order_factory=order_factory,
         clock=clock,
     )
 
