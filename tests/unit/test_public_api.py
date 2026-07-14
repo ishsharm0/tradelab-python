@@ -48,3 +48,19 @@ def test_documented_root_exports_are_public() -> None:
     }
     assert expected <= set(tradelab.__all__)
     assert all(hasattr(tradelab, name) for name in expected)
+
+
+def test_live_namespace_reexports_runtime_and_broker_adapters() -> None:
+    live = importlib.import_module("tradelab.live")
+    expected = {
+        "AlpacaBroker",
+        "BinanceBroker",
+        "CoinbaseBroker",
+        "InteractiveBrokersBroker",
+        "LiveEngine",
+        "LiveOrchestrator",
+        "SessionManager",
+        "create_dashboard_server",
+    }
+    assert expected <= set(live.__all__)
+    assert all(hasattr(live, name) for name in expected)
