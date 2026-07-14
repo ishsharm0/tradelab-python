@@ -130,6 +130,11 @@ async def test_accepted_exit_is_not_resubmitted_on_later_triggering_bars(tmp_pat
     assert len(await broker.get_open_orders()) == 1
     assert engine.open_position["_pendingExitOrderId"] == "paper-1"
     assert engine.open_position["_pendingExitClientOrderId"].startswith("single-exit-exit-")
+    assert engine.get_status()["openPosition"]["pendingExit"] == {
+        "orderId": "paper-1",
+        "clientOrderId": engine.open_position["_pendingExitClientOrderId"],
+        "reason": "SL",
+    }
     await engine.stop()
 
 

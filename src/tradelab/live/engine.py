@@ -94,6 +94,13 @@ def _snapshot(position: Mapping[str, Any], mark_price: float) -> dict[str, Any]:
     entry = float(position.get("entryFill", position.get("entry", 0)))
     size = float(position.get("size", 0))
     direction = 1 if position.get("side") == "long" else -1
+    pending_exit = None
+    if position.get("_pendingExitClientOrderId"):
+        pending_exit = {
+            "orderId": position.get("_pendingExitOrderId"),
+            "clientOrderId": position.get("_pendingExitClientOrderId"),
+            "reason": position.get("_pendingExitReason"),
+        }
     return {
         "id": position.get("id"),
         "symbol": position.get("symbol"),
@@ -107,6 +114,7 @@ def _snapshot(position: Mapping[str, Any], mark_price: float) -> dict[str, Any]:
         "markPrice": mark_price,
         "unrealizedPnl": (mark_price - entry) * direction * size,
         "_initRisk": position.get("_initRisk"),
+        "pendingExit": pending_exit,
     }
 
 
