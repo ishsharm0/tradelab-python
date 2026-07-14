@@ -8,6 +8,10 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     if: startsWith(github.event.release.tag_name, 'v') && vars.PYPI_PUBLISH_ENABLED == 'true'
@@ -16,11 +20,13 @@ jobs:
       name: pypi
       url: https://pypi.org/project/tradelab-python/
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           python-version: "3.11"
-          enable-cache: true
+          enable-cache: false
       - run: uv sync --all-extras --locked
       - name: Verify release tag and package version match
         run: |
@@ -29,7 +35,7 @@ jobs:
       - run: uv lock --check
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run mypy src examples scripts
+      - run: uv run mypy --strict src examples scripts
       - name: Audit with new external connections blocked
         run: |
           sudo iptables -I OUTPUT 1 ! -o lo -m conntrack --ctstate NEW -j REJECT
@@ -46,4 +52,4 @@ jobs:
       - run: uv venv .release-venv --python 3.11
       - run: uv pip install --python .release-venv/bin/python dist/*.whl pytest pytest-asyncio
       - run: TRADELAB_RELEASE_PYTHON="$PWD/.release-venv/bin/python" .release-venv/bin/python -m pytest tests/e2e/test_installed_package.py -q
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
