@@ -61,6 +61,21 @@ EXPECTED_NAMES = (
     "research_close",
 )
 
+
+def test_mcp_entrypoint_help_and_version_do_not_start_stdio(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(mcp_server.sys, "argv", ["tradelab-mcp", "--help"])
+    mcp_server.entrypoint()
+    help_output = capsys.readouterr().out
+    assert "Usage: tradelab-mcp" in help_output
+    assert "Model Context Protocol" in help_output
+
+    monkeypatch.setattr(mcp_server.sys, "argv", ["tradelab-mcp", "--version"])
+    mcp_server.entrypoint()
+    assert capsys.readouterr().out.strip() == "1.3.1"
+
+
 EXPECTED_DESCRIPTIONS = {
     "list_strategies": "List built-in trading strategies with their tunable parameters.",
     "fetch_candles": "Download/caches OHLCV candles from Yahoo or CSV. Returns a compact summary.",
@@ -155,6 +170,7 @@ class FakeSession:
         self.symbols = ["AAPL"]
         self.bars: list[dict[str, Any]] = []
         self.orders: list[dict[str, Any]] = []
+        self.order_error: Exception | None = None
         self.canceled: list[str] = []
         self.flattened = False
 
@@ -171,6 +187,8 @@ class FakeSession:
         return [dict(bar) for bar in self.bars]
 
     async def place_order(self, **order: Any) -> dict[str, Any]:
+        if self.order_error is not None:
+            raise self.order_error
         self.orders.append(order)
         return {"status": "filled", **order}
 
@@ -441,6 +459,65 @@ async def test_live_handlers_report_unknown_sessions_and_missing_prices() -> Non
 
 
 @pytest.mark.asyncio
+async def test_attached_strategy_is_cleared_on_halt_and_session_recreation() -> None:
+    def factory(_params: Mapping[str, Any]) -> Callable[[Mapping[str, Any]], object]:
+        return lambda _context: {"side": "long", "qty": 1}
+
+    dependencies = _deps(strategy_factory=factory)
+    tools = build_tools(dependencies)
+    await tools["create_session"].handler({"sessionId": "demo", "symbol": "AAPL"})
+    await tools["attach_strategy"].handler(
+        {"sessionId": "demo", "strategy": "buy-hold", "symbol": "AAPL"}
+    )
+
+    await tools["create_session"].handler({"sessionId": "demo", "symbol": "AAPL"})
+    await tools["feed_price"].handler({"sessionId": "demo", "price": 100})
+    recreated = dependencies.session_manager.get("demo")
+    assert recreated is not None
+    assert recreated.orders == []
+
+    await tools["attach_strategy"].handler(
+        {"sessionId": "demo", "strategy": "buy-hold", "symbol": "AAPL"}
+    )
+    await tools["halt_all"].handler({})
+    await tools["create_session"].handler({"sessionId": "demo", "symbol": "AAPL"})
+    await tools["feed_price"].handler({"sessionId": "demo", "price": 101})
+    after_halt = dependencies.session_manager.get("demo")
+    assert after_halt is not None
+    assert after_halt.orders == []
+
+
+@pytest.mark.asyncio
+async def test_attached_strategy_and_order_failures_are_reported() -> None:
+    dependencies = _deps(
+        strategy_factory=lambda _params: (
+            lambda _context: (_ for _ in ()).throw(RuntimeError("strategy failed"))
+        )
+    )
+    tools = build_tools(dependencies)
+    await tools["create_session"].handler({"sessionId": "demo", "symbol": "AAPL"})
+    await tools["attach_strategy"].handler(
+        {"sessionId": "demo", "strategy": "broken", "symbol": "AAPL"}
+    )
+    with pytest.raises(RuntimeError, match="strategy failed"):
+        await tools["feed_price"].handler({"sessionId": "demo", "price": 100})
+
+    dependencies = _deps(
+        strategy_factory=lambda _params: lambda _context: {"side": "long", "qty": 1}
+    )
+    tools = build_tools(dependencies)
+    await tools["create_session"].handler({"sessionId": "demo", "symbol": "AAPL"})
+    await tools["attach_strategy"].handler(
+        {"sessionId": "demo", "strategy": "buy-hold", "symbol": "AAPL"}
+    )
+    session = dependencies.session_manager.get("demo")
+    assert session is not None
+    session.order_error = RuntimeError("broker rejected")
+    with pytest.raises(RuntimeError, match="broker rejected"):
+        await tools["feed_price"].handler({"sessionId": "demo", "price": 100})
+
+
+@pytest.mark.asyncio
 async def test_sdk_server_and_invocation_return_strict_text_results_and_errors() -> None:
     tools = build_tools(_deps())
     server = create_server(tools=tools)
@@ -600,6 +677,7 @@ def test_entrypoint_and_version_fallback(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(mcp_server.asyncio, "run", run)
     monkeypatch.setattr(mcp_server, "version", missing_version)
+    monkeypatch.setattr(mcp_server.sys, "argv", ["tradelab-mcp"])
     assert isinstance(create_server(tools=build_tools(_deps())), Server)
     mcp_server.entrypoint()
     assert len(calls) == 1

@@ -473,6 +473,9 @@ def build_tools(dependencies: McpDependencies | None = None) -> dict[str, ToolDe
         if args.get("maxDailyLossPct") is not None:
             options["max_daily_loss_pct"] = args["maxDailyLossPct"]
         session = await _maybe_await(deps.session_manager.create(**options))
+        session_id = str(cast(Any, session).id)
+        for key in [key for key in attached if key[0] == session_id]:
+            attached.pop(key, None)
         return cast(Any, session).get_status()
 
     async def list_sessions_handler(_args: Mapping[str, Any]) -> object:
@@ -514,28 +517,24 @@ def build_tools(dependencies: McpDependencies | None = None) -> dict[str, ToolDe
             or _mapping(item, "position").get("symbol") == effective_symbol
         ]
         if strategy_fn is not None and not symbol_positions:
-            try:
-                candles = session.candle_buffer_for(effective_symbol)
-                context = {
-                    "candles": candles,
-                    "index": len(candles) - 1,
-                    "bar": candles[-1] if candles else None,
-                    "equity": status.get("equity"),
-                    "openPosition": None,
-                    "pendingOrder": None,
-                }
-                raw_signal = strategy_fn(context)
-                if inspect.isawaitable(raw_signal):
-                    raw_signal = await cast(Awaitable[object], raw_signal)
-                if isinstance(raw_signal, Mapping) and any(
-                    raw_signal.get(key) for key in ("side", "direction", "action")
-                ):
-                    order = _signal_order(cast(Mapping[str, Any], raw_signal))
-                    order["symbol"] = effective_symbol
-                    with suppress(Exception):
-                        await _maybe_await(session.place_order(**order))
-            except Exception:
-                pass
+            candles = session.candle_buffer_for(effective_symbol)
+            context = {
+                "candles": candles,
+                "index": len(candles) - 1,
+                "bar": candles[-1] if candles else None,
+                "equity": status.get("equity"),
+                "openPosition": None,
+                "pendingOrder": None,
+            }
+            raw_signal = strategy_fn(context)
+            if inspect.isawaitable(raw_signal):
+                raw_signal = await cast(Awaitable[object], raw_signal)
+            if isinstance(raw_signal, Mapping) and any(
+                raw_signal.get(key) for key in ("side", "direction", "action")
+            ):
+                order = _signal_order(cast(Mapping[str, Any], raw_signal))
+                order["symbol"] = effective_symbol
+                await _maybe_await(session.place_order(**order))
         return session.get_status()
 
     async def place_order_handler(args: Mapping[str, Any]) -> object:
@@ -588,7 +587,10 @@ def build_tools(dependencies: McpDependencies | None = None) -> dict[str, ToolDe
         return {"ok": True, "strategy": args.get("strategy"), "params": dict(params)}
 
     async def halt_all_handler(_args: Mapping[str, Any]) -> object:
-        await _maybe_await(deps.session_manager.halt_all())
+        try:
+            await _maybe_await(deps.session_manager.halt_all())
+        finally:
+            attached.clear()
         return {"ok": True, "sessionsHalted": len(deps.session_manager.list())}
 
     async def research_open_handler(args: Mapping[str, Any]) -> object:

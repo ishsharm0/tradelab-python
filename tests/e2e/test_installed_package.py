@@ -57,4 +57,4 @@ print(json.dumps({'version': tradelab.__version__, 'namespaces': names}))
         text=True,
         timeout=10,
     )
-    assert mcp.returncode == 0
+    assert "Model Context Protocol" in mcp.stdout

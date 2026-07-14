@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
@@ -137,6 +138,20 @@ async def run_stdio_server(server: Server | None = None) -> None:
 
 def entrypoint() -> None:
     """Console-script entrypoint for ``tradelab-mcp``."""
+    arguments = sys.argv[1:]
+    if any(argument in {"-h", "--help"} for argument in arguments):
+        print(
+            "Usage: tradelab-mcp [--help] [--version]\n\n"
+            "Serve TradeLab's 25 research and trading tools over the "
+            "Model Context Protocol on stdio."
+        )
+        return
+    if any(argument in {"-V", "--version"} for argument in arguments):
+        print(_package_version())
+        return
+    if arguments:
+        print(f"tradelab-mcp: unknown argument: {arguments[0]}", file=sys.stderr)
+        raise SystemExit(2)
     asyncio.run(run_stdio_server())
 
 
