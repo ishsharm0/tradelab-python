@@ -1,5 +1,7 @@
 """TradeLab's public Python API."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from . import research
 from .data import (
     backtest_historical,
@@ -68,6 +70,11 @@ from .utils import (
     swing_low,
 )
 
+try:
+    __version__ = version("tradelab-python")
+except PackageNotFoundError:  # pragma: no cover - only possible outside an installation
+    __version__ = "1.3.1"
+
 __all__ = [
     "BIG_NUMBER",
     "BacktestResult",
@@ -83,6 +90,7 @@ __all__ = [
     "StrategyError",
     "TradeLabError",
     "ValidationError",
+    "__version__",
     "atr",
     "backtest",
     "backtest_async",
