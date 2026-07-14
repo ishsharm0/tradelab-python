@@ -22,7 +22,13 @@ from tradelab.brokers import (
 from tradelab.data import get_historical_candles, load_candles_from_csv, save_candles_to_cache
 from tradelab.engine import backtest, backtest_portfolio, grid, walk_forward_optimize
 from tradelab.errors import LiveTradingDisabledError, TradeLabError, ValidationError
-from tradelab.live import JsonFileStorage, LiveEngine, PaperEngine
+from tradelab.live import (
+    JsonFileStorage,
+    LiveEngine,
+    LiveOrchestrator,
+    PaperEngine,
+    create_dashboard_server,
+)
 from tradelab.reporting import export_backtest_artifacts, export_metrics_json, summarize
 from tradelab.strategies import get_strategy, list_strategies
 
@@ -30,6 +36,40 @@ VERSION = "1.3.1"
 T = TypeVar("T")
 Strategy = Callable[[Mapping[str, Any]], object]
 StrategyFactory = Callable[[Mapping[str, object]], Strategy]
+
+_SYSTEM_OPTION_ALIASES = {
+    "pollIntervalMs": "poll_interval_ms",
+    "warmupBars": "warmup_bars",
+    "riskPct": "risk_pct",
+    "finalTpR": "final_tp_r",
+    "flattenAtClose": "flatten_at_close",
+    "qtyStep": "qty_step",
+    "minQty": "min_qty",
+    "maxLeverage": "max_leverage",
+    "dailyMaxTrades": "daily_max_trades",
+    "maxDailyLossPct": "max_daily_loss_pct",
+    "entryChase": "entry_chase",
+}
+_SYSTEM_OPTIONS = {
+    "id",
+    "symbol",
+    "interval",
+    "mode",
+    "weight",
+    "poll_interval_ms",
+    "warmup_bars",
+    "risk_pct",
+    "final_tp_r",
+    "flatten_at_close",
+    "qty_step",
+    "min_qty",
+    "max_leverage",
+    "daily_max_trades",
+    "max_daily_loss_pct",
+    "entry_chase",
+    "oco",
+    "risk",
+}
 
 app = typer.Typer(
     name="tradelab",
@@ -118,6 +158,182 @@ def _broker_config(name: str) -> dict[str, object]:
         "client_id": int(os.environ.get("TRADELAB_IB_CLIENT_ID", "1")),
         "paper": False,
     }
+
+
+def _load_live_config(path: Path) -> dict[str, object]:
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValidationError(f'config "{path}" is not valid JSON') from error
+    if not isinstance(parsed, dict):
+        raise ValidationError("config must be a JSON object")
+    return cast(dict[str, object], parsed)
+
+
+def _config_strategy(value: object, *, base_dir: Path, fallback: str) -> str:
+    selected = fallback if value is None else value
+    if not isinstance(selected, str) or not selected.strip():
+        raise ValidationError("each configured system strategy must be a non-empty string")
+    path = Path(selected).expanduser()
+    if path.suffix == ".py" and not path.is_absolute():
+        return str((base_dir / path).resolve())
+    return selected
+
+
+def _config_systems(
+    config: Mapping[str, object],
+    *,
+    base_dir: Path,
+    strategy: str,
+    params: Mapping[str, object],
+    defaults: Mapping[str, object],
+) -> tuple[list[dict[str, object]], list[tuple[str, str, Path]]]:
+    raw_systems = config.get("systems")
+    if not isinstance(raw_systems, list) or not raw_systems:
+        raise ValidationError("config requires a non-empty systems array")
+    systems: list[dict[str, object]] = []
+    replays: list[tuple[str, str, Path]] = []
+    replay_sources: dict[tuple[str, str], Path] = {}
+    configured_symbols: set[str] = set()
+    for index, raw in enumerate(raw_systems):
+        if not isinstance(raw, Mapping):
+            raise ValidationError(f"config system {index + 1} must be a JSON object")
+        raw_params = raw.get("params", params)
+        if not isinstance(raw_params, Mapping):
+            raise ValidationError(f"config system {index + 1} params must be a JSON object")
+        selected_strategy = _config_strategy(
+            raw.get("strategy"), base_dir=base_dir, fallback=strategy
+        )
+        system: dict[str, object] = {}
+        for key, value in raw.items():
+            if not isinstance(key, str):
+                raise ValidationError(f"config system {index + 1} keys must be strings")
+            canonical = _SYSTEM_OPTION_ALIASES.get(key, key)
+            if canonical in _SYSTEM_OPTIONS:
+                system[canonical] = value
+        for key, value in defaults.items():
+            system.setdefault(key, value)
+        symbol = system.get("symbol")
+        interval = system.get("interval", "1m")
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValidationError(f"config system {index + 1} requires symbol")
+        if not isinstance(interval, str) or not interval.strip():
+            raise ValidationError(f"config system {index + 1} requires interval")
+        normalized_symbol = symbol.strip().upper()
+        if normalized_symbol in configured_symbols:
+            raise ValidationError(
+                f'config contains duplicate symbol "{symbol.strip()}"; '
+                "shared broker order events require one system per symbol"
+            )
+        configured_symbols.add(normalized_symbol)
+        system["symbol"] = symbol.strip()
+        system["interval"] = interval.strip()
+        system["signal"] = _load_strategy_factory(selected_strategy)(dict(raw_params))
+        systems.append(system)
+        csv_value = raw.get("csvPath", raw.get("csv_path"))
+        if csv_value is not None:
+            if not isinstance(csv_value, str) or not csv_value.strip():
+                raise ValidationError(f"config system {index + 1} csvPath must be a path string")
+            csv_path = Path(csv_value).expanduser()
+            if not csv_path.is_absolute():
+                csv_path = base_dir / csv_path
+            if not csv_path.is_file():
+                raise ValidationError(f'configured CSV "{csv_path}" does not exist')
+            market = (symbol.strip(), interval.strip())
+            existing = replay_sources.get(market)
+            if existing is not None and existing.resolve() != csv_path.resolve():
+                raise ValidationError(
+                    f"conflicting CSV paths configured for {market[0]} {market[1]}"
+                )
+            if existing is None:
+                replay_sources[market] = csv_path
+                replays.append((*market, csv_path))
+    return systems, replays
+
+
+def _orchestrator_options(
+    config: Mapping[str, object], *, fallback_equity: float
+) -> tuple[str, object, object]:
+    allocation = config.get("allocation", "equal")
+    if allocation == "weight":
+        allocation = "weighted"
+    if not isinstance(allocation, str):
+        raise ValidationError("config allocation must be equal or weighted")
+    return (
+        allocation,
+        config.get("equity", fallback_equity),
+        config.get("maxDailyLossPct", config.get("max_daily_loss_pct", 0)),
+    )
+
+
+async def _wait_until_cancelled() -> None:
+    await asyncio.Event().wait()
+
+
+async def _stop_live_runtime(runtime: object) -> None:
+    raw_engines = getattr(runtime, "engines", None)
+    engines = list(raw_engines) if isinstance(raw_engines, list) else [runtime]
+    failure: BaseException | None = None
+    for engine in reversed(engines):
+        getter = getattr(engine, "get_status", None)
+        try:
+            status = getter() if callable(getter) else {}
+        except BaseException as error:
+            failure = failure or error
+            status = {}
+        pending = status.get("pendingOrder") if isinstance(status, Mapping) else None
+        order_id = pending.get("orderId") if isinstance(pending, Mapping) else None
+        broker = getattr(engine, "broker", None)
+        cancel = getattr(broker, "cancel_order", None)
+        if order_id and callable(cancel):
+            try:
+                await cancel(str(order_id))
+            except BaseException as error:
+                failure = failure or error
+    stop_runtime = getattr(runtime, "stop", None)
+    if callable(stop_runtime):
+        try:
+            await stop_runtime(flatten_on_shutdown=True)
+        except BaseException as error:
+            failure = failure or error
+    if failure is not None:
+        raise failure
+
+
+async def _run_owned_runtime(
+    runtime: object,
+    *,
+    dashboard: bool,
+    dashboard_port: int,
+    watch: bool,
+    work: Callable[[], Coroutine[Any, Any, None]] | None = None,
+    live_cleanup: bool = False,
+) -> dict[str, object]:
+    dashboard_server: object | None = None
+    try:
+        await cast(Any, runtime).start()
+        if dashboard:
+            dashboard_server = create_dashboard_server(source=runtime, port=dashboard_port)
+            url = await cast(Any, dashboard_server).start()
+            typer.echo(f"dashboard: {url}", err=True)
+            token = getattr(dashboard_server, "command_token", None)
+            if isinstance(token, str) and token:
+                typer.echo(f"dashboard token: {token}", err=True)
+        if work is not None:
+            await work()
+        if watch:
+            await _wait_until_cancelled()
+        status = cast(Any, runtime).get_status()
+        return dict(status) if isinstance(status, Mapping) else {}
+    finally:
+        try:
+            if dashboard_server is not None:
+                await cast(Any, dashboard_server).close()
+        finally:
+            if live_cleanup:
+                await _stop_live_runtime(runtime)
+            else:
+                await cast(Any, runtime).stop()
 
 
 def _version_callback(value: bool) -> None:
@@ -470,16 +686,70 @@ def paper(
     strategy: str = typer.Option("buy-hold"),
     params: str = typer.Option("{}", help="Strategy parameters as JSON."),
     csv_path: Path | None = typer.Option(None, exists=True, dir_okay=False),
+    config: Path | None = typer.Option(None, exists=True, dir_okay=False),
     state_dir: Path = typer.Option(Path("output/live-state")),
     equity: float = typer.Option(10_000, min=0),
     risk_pct: float = typer.Option(1, min=0),
     warmup_bars: int = typer.Option(0, min=0),
+    dashboard: bool = typer.Option(False, "--dashboard", help="Start a loopback dashboard."),
+    dashboard_port: int = typer.Option(4_317, "--dashboard-port", min=0, max=65_535),
+    watch: bool = typer.Option(False, "--watch", help="Run until interrupted."),
 ) -> None:
-    """Replay optional CSV bars through the credential-free paper live engine."""
+    """Run one or more credential-free paper systems with optional CSV replay."""
 
     async def run() -> dict[str, object]:
+        strategy_params = _json_mapping(params, "params")
+        if config is not None:
+            file_config = _load_live_config(config)
+            systems, replays = _config_systems(
+                file_config,
+                base_dir=config.parent,
+                strategy=strategy,
+                params=strategy_params,
+                defaults={
+                    "symbol": symbol,
+                    "interval": interval,
+                    "warmup_bars": warmup_bars,
+                    "risk_pct": risk_pct,
+                },
+            )
+            allocation, configured_equity, max_daily_loss_pct = _orchestrator_options(
+                file_config, fallback_equity=equity
+            )
+            broker = PaperEngine(equity=configured_equity)
+            runtime: object = LiveOrchestrator(
+                systems=systems,
+                broker=broker,
+                storage=JsonFileStorage(base_dir=state_dir),
+                allocation=allocation,
+                equity=configured_equity,
+                max_daily_loss_pct=max_daily_loss_pct,
+            )
+            bars_processed = 0
+
+            async def replay_config() -> None:
+                nonlocal bars_processed
+                for replay_symbol, replay_interval, replay_path in replays:
+                    replay_bars = load_candles_from_csv(replay_path)
+                    bars_processed += len(replay_bars)
+                    for bar in replay_bars:
+                        await broker.simulate_bar(replay_symbol, replay_interval, bar)
+
+            status = await _run_owned_runtime(
+                runtime,
+                dashboard=dashboard,
+                dashboard_port=dashboard_port,
+                watch=watch,
+                work=replay_config,
+            )
+            return {
+                "mode": "paper",
+                "barsProcessed": bars_processed,
+                **status,
+            }
+
         broker = PaperEngine(equity=equity)
-        signal = _load_strategy_factory(strategy)(_json_mapping(params, "params"))
+        signal = _load_strategy_factory(strategy)(strategy_params)
         engine = LiveEngine(
             id=f"paper-{symbol}-{interval}",
             symbol=symbol,
@@ -492,13 +762,19 @@ def paper(
             warmup_bars=warmup_bars,
         )
         bars = load_candles_from_csv(csv_path) if csv_path is not None else []
-        await engine.start()
-        try:
+
+        async def replay() -> None:
             for bar in bars:
                 await broker.simulate_bar(symbol, interval, bar)
-            return {"mode": "paper", "barsProcessed": len(bars), **engine.get_status()}
-        finally:
-            await engine.stop()
+
+        status = await _run_owned_runtime(
+            engine,
+            dashboard=dashboard,
+            dashboard_port=dashboard_port,
+            watch=watch,
+            work=replay,
+        )
+        return {"mode": "paper", "barsProcessed": len(bars), **status}
 
     try:
         typer.echo(json.dumps(_run(run()), indent=2, allow_nan=False))
@@ -511,14 +787,17 @@ def paper(
 @app.command()
 def live(
     broker: str = typer.Option(..., help="Broker: alpaca, binance, coinbase, or ib."),
-    symbol: str = typer.Option(...),
+    symbol: str | None = typer.Option(None),
     interval: str = typer.Option("1m"),
     strategy: str = typer.Option("ema-cross"),
     params: str = typer.Option("{}", help="Strategy parameters as JSON."),
+    config: Path | None = typer.Option(None, exists=True, dir_okay=False),
     state_dir: Path = typer.Option(Path("output/live-state")),
     confirm_live: bool = typer.Option(False, "--confirm-live"),
     warmup_bars: int = typer.Option(200, min=0),
     watch: bool = typer.Option(False, "--watch", help="Run until interrupted."),
+    dashboard: bool = typer.Option(False, "--dashboard", help="Start a loopback dashboard."),
+    dashboard_port: int = typer.Option(4_317, "--dashboard-port", min=0, max=65_535),
 ) -> None:
     """Start a permission-gated live engine; uncertified adapters fail closed."""
     try:
@@ -532,29 +811,60 @@ def live(
             raise LiveTradingDisabledError(
                 f"{broker} lacks certified streaming order updates; live execution is disabled"
             )
-        signal = _load_strategy_factory(strategy)(_json_mapping(params, "params"))
+        if watch is not True:
+            raise LiveTradingDisabledError(
+                "live requires --watch so submitted orders and positions remain managed"
+            )
+        strategy_params = _json_mapping(params, "params")
 
         async def run() -> dict[str, object]:
-            engine = LiveEngine(
-                id=f"live-{broker}-{symbol}-{interval}",
-                symbol=symbol,
-                interval=interval,
-                signal=signal,
-                broker=adapter,
-                broker_config=_broker_config(broker),
-                storage=JsonFileStorage(base_dir=state_dir),
-                warmup_bars=warmup_bars,
-                confirm_live=True,
+            if config is not None:
+                file_config = _load_live_config(config)
+                systems, replays = _config_systems(
+                    file_config,
+                    base_dir=config.parent,
+                    strategy=strategy,
+                    params=strategy_params,
+                    defaults={"interval": interval, "warmup_bars": warmup_bars},
+                )
+                if replays:
+                    raise ValidationError("csvPath is paper-only and cannot be used by live")
+                allocation, configured_equity, max_daily_loss_pct = _orchestrator_options(
+                    file_config, fallback_equity=10_000
+                )
+                runtime: object = LiveOrchestrator(
+                    systems=systems,
+                    broker=adapter,
+                    storage=JsonFileStorage(base_dir=state_dir),
+                    broker_config=_broker_config(broker),
+                    confirm_live=True,
+                    allocation=allocation,
+                    equity=configured_equity,
+                    max_daily_loss_pct=max_daily_loss_pct,
+                )
+            else:
+                if symbol is None or not symbol.strip():
+                    raise ValidationError("live requires --symbol when --config is not provided")
+                signal = _load_strategy_factory(strategy)(strategy_params)
+                runtime = LiveEngine(
+                    id=f"live-{broker}-{symbol}-{interval}",
+                    symbol=symbol,
+                    interval=interval,
+                    signal=signal,
+                    broker=adapter,
+                    broker_config=_broker_config(broker),
+                    storage=JsonFileStorage(base_dir=state_dir),
+                    warmup_bars=warmup_bars,
+                    confirm_live=True,
+                )
+            status = await _run_owned_runtime(
+                runtime,
+                dashboard=dashboard,
+                dashboard_port=dashboard_port,
+                watch=True,
+                live_cleanup=True,
             )
-            await engine.start()
-            try:
-                if watch:
-                    await asyncio.Event().wait()
-                else:
-                    await engine.poll_once()
-                return {"mode": "live", **engine.get_status()}
-            finally:
-                await engine.stop()
+            return {"mode": "live", **status}
 
         typer.echo(json.dumps(_run(run()), indent=2, allow_nan=False))
     except typer.BadParameter:

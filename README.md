@@ -141,7 +141,7 @@ print(session.get_status())
 await manager.halt_all()
 ```
 
-Paper mode needs no credentials. Live mode requires all three conditions:
+Paper mode needs no credentials. Live mode requires all four conditions:
 
 1. `TRADELAB_ALLOW_LIVE=true`
 2. `confirm_live=True`
@@ -160,7 +160,65 @@ tradelab run ema-cross --source yahoo --symbol SPY --params '{"fast": 8}'
 tradelab prefetch --symbol SPY --interval 1d --period 1y
 tradelab import-csv ./data/spy.csv --symbol SPY --interval 1d
 tradelab paper --csv-path ./data/spy.csv --symbol SPY --strategy ema-cross
+tradelab paper --config ./paper-portfolio.json --dashboard --dashboard-port 4317 --watch
 tradelab status --state-dir ./output/live-state
+```
+
+`paper --config` and `live --config` run several systems through one `LiveOrchestrator`.
+Strategy and CSV paths in the config are resolved relative to the config file; registered strategy
+names work too. Both snake-case Python options and the documented camel-case JSON aliases are
+accepted for engine settings:
+
+```json
+{
+  "allocation": "weighted",
+  "equity": 50000,
+  "maxDailyLossPct": 3,
+  "systems": [
+    {
+      "id": "spy",
+      "symbol": "SPY",
+      "interval": "1m",
+      "strategy": "ema-cross",
+      "params": {"fast": 8, "slow": 21},
+      "weight": 2,
+      "csvPath": "./data/spy.csv"
+    },
+    {
+      "id": "qqq",
+      "symbol": "QQQ",
+      "strategy": "./strategies/qqq.py",
+      "weight": 1
+    }
+  ]
+}
+```
+
+Use at most one configured system per symbol. Broker order events are symbol-scoped, so the CLI
+rejects duplicate symbols instead of allowing one strategy's fills to corrupt another's state.
+`csvPath` is paper-only; live configs reject historical replay sources.
+
+The optional dashboard binds to loopback and closes with its engine or orchestrator. `--watch`
+runs until interruption; cleanup closes the dashboard before stopping every runtime. Live trading
+requires `--watch` so a successful command cannot submit an order and immediately disconnect.
+On live shutdown the CLI cancels identified pending entry orders and requests position flattening
+before disconnect. The environment opt-in, explicit confirmation, credentials, and certified
+streaming-order-update gates still apply, so bundled REST-only adapters continue to fail closed.
+
+The CLI prints the ephemeral dashboard command token to stderr beside the URL. Supply it on every
+dashboard request without mixing it into JSON stdout, for example:
+
+```bash
+curl -H "X-Tradelab-Token: $TOKEN" http://127.0.0.1:4317/state
+```
+
+For example, this bundled-adapter live command is intentionally refused until its adapter provides
+certified authenticated streaming order updates:
+
+```bash
+TRADELAB_ALLOW_LIVE=true tradelab live \
+  --broker alpaca --config ./live-portfolio.json \
+  --confirm-live --watch --dashboard
 ```
 
 `--strategy` accepts either a registered name or a local Python file. A strategy file defines
@@ -200,13 +258,15 @@ uv sync --all-extras
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy src tests
+uv run mypy --strict src examples scripts
 uv build
 uv run twine check dist/*
 ```
 
-Additional references: [architecture](docs/architecture.md), [API map](docs/api.md),
-[live safety](docs/safety.md), and [MCP tools](docs/mcp.md).
+Additional references: [architecture](https://github.com/ishsharm0/tradelab-python/blob/main/docs/architecture.md),
+[API map](https://github.com/ishsharm0/tradelab-python/blob/main/docs/api.md),
+[live safety](https://github.com/ishsharm0/tradelab-python/blob/main/docs/safety.md), and
+[MCP tools](https://github.com/ishsharm0/tradelab-python/blob/main/docs/mcp.md).
 
 The original JavaScript repository is used as an immutable parity oracle. Python adds
 stricter finite-number, path-containment, atomic-write, concurrency, and timezone safety
