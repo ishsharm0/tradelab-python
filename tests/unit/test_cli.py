@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 import tradelab.cli as cli
@@ -433,10 +434,11 @@ def test_paper_closes_dashboard_and_stops_engine_when_dashboard_start_fails(
 def test_live_help_exposes_config_dashboard_and_watch_options() -> None:
     result = RUNNER.invoke(app, ["live", "--help"])
     assert result.exit_code == 0, result.output
-    assert "--config" in result.stdout
-    assert "--dashboard" in result.stdout
-    assert "--dashboard-port" in result.stdout
-    assert "--watch" in result.stdout
+    output = unstyle(result.stdout)
+    assert "--config" in output
+    assert "--dashboard" in output
+    assert "--dashboard-port" in output
+    assert "--watch" in output
 
 
 def test_live_requires_watch_after_all_permission_gates(
@@ -454,7 +456,7 @@ def test_live_requires_watch_after_all_permission_gates(
     )
 
     assert result.exit_code != 0
-    assert "--watch" in result.output
+    assert "--watch" in unstyle(result.output)
 
 
 def test_live_watch_cancels_pending_entry_and_delegates_exit_flatten_to_engine(
