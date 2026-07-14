@@ -7,6 +7,7 @@ be audited without printing credentials, headers, query strings, or bodies.
 
 from __future__ import annotations
 
+import ipaddress
 import socket
 import sys
 from collections.abc import Callable
@@ -41,8 +42,27 @@ class NetworkAudit:
         self._sync_send = httpx.Client.send
         audit = self
 
+        def is_local(sock: socket.socket, address: object) -> bool:
+            if sock.family == socket.AF_UNIX:
+                return True
+            host = address[0] if isinstance(address, tuple) and address else None
+            try:
+                return isinstance(host, str) and ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                return False
+
         def blocked_connect(sock: socket.socket, address: object) -> None:
-            del sock
+            if is_local(sock, address):
+                assert audit._socket_connect is not None
+                audit._socket_connect(sock, address)
+                return
+            raise RuntimeError(f"unmocked network socket blocked: {address!r}")
+
+        def blocked_connect_ex(sock: socket.socket, address: object) -> int:
+            if is_local(sock, address):
+                assert audit._socket_connect_ex is not None
+                result = audit._socket_connect_ex(sock, address)
+                return int(result)
             raise RuntimeError(f"unmocked network socket blocked: {address!r}")
 
         def blocked_create_connection(*args: object, **kwargs: object) -> None:
@@ -76,7 +96,7 @@ class NetworkAudit:
             return response
 
         socket.socket.connect = blocked_connect  # type: ignore[assignment]
-        socket.socket.connect_ex = blocked_connect  # type: ignore[assignment]
+        socket.socket.connect_ex = blocked_connect_ex  # type: ignore[assignment]
         socket.create_connection = blocked_create_connection  # type: ignore[assignment]
         socket.getaddrinfo = blocked_resolution  # type: ignore[assignment]
         socket.gethostbyname = blocked_resolution  # type: ignore[assignment]
