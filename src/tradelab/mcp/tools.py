@@ -228,6 +228,8 @@ def build_tools(dependencies: McpDependencies | None = None) -> dict[str, ToolDe
     halt_lock = asyncio.Lock()
     halt_generation = 0
     halting = False
+    active_halts = 0
+    halt_tasks: set[asyncio.Task[object]] = set()
 
     @asynccontextmanager
     async def live_operation() -> AsyncIterator[None]:
@@ -621,18 +623,28 @@ def build_tools(dependencies: McpDependencies | None = None) -> dict[str, ToolDe
             return {"ok": True, "strategy": args.get("strategy"), "params": dict(params)}
 
     async def halt_all_handler(_args: Mapping[str, Any]) -> object:
-        nonlocal halt_generation, halting
-        async with halt_lock:
-            halt_generation += 1
-            halting = True
-            attached.clear()
+        nonlocal active_halts, halt_generation, halting
+
+        async def finish_halt() -> object:
+            nonlocal active_halts, halting
             try:
                 async with operation_lock:
                     await _maybe_await(deps.session_manager.halt_all())
+                return {"ok": True, "sessionsHalted": len(deps.session_manager.list())}
             finally:
                 attached.clear()
-                halting = False
-            return {"ok": True, "sessionsHalted": len(deps.session_manager.list())}
+                active_halts -= 1
+                halting = active_halts > 0
+
+        async with halt_lock:
+            halt_generation += 1
+            halting = True
+            active_halts += 1
+            attached.clear()
+            task = asyncio.create_task(finish_halt())
+            halt_tasks.add(task)
+            task.add_done_callback(halt_tasks.discard)
+        return await asyncio.shield(task)
 
     async def research_open_handler(args: Mapping[str, Any]) -> object:
         return _camelize(

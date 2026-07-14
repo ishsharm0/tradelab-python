@@ -71,8 +71,8 @@ jobs:
       - run: uv build
       - run: uv run twine check dist/*
       - run: uv venv .release-venv --python 3.11
-      - run: uv pip install --python .release-venv/bin/python dist/*.whl pytest
-      - run: TRADELAB_RELEASE_PYTHON=.release-venv/bin/python .release-venv/bin/python -m pytest tests/e2e/test_installed_package.py -q
+      - run: uv pip install --python .release-venv/bin/python dist/*.whl pytest pytest-asyncio
+      - run: TRADELAB_RELEASE_PYTHON="$PWD/.release-venv/bin/python" .release-venv/bin/python -m pytest tests/e2e/test_installed_package.py -q
       - uses: actions/upload-artifact@v4
         with:
           name: python-distributions

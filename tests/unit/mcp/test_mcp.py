@@ -544,11 +544,18 @@ async def test_halt_all_blocks_an_inflight_attached_strategy_order() -> None:
     await evaluating.wait()
     halt_task = asyncio.create_task(tools["halt_all"].handler({}))
     await asyncio.sleep(0)
+    halt_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await halt_task
     release.set()
 
     with pytest.raises(LiveTradingDisabledError, match="kill switch"):
         await feed_task
-    await halt_task
+    for _ in range(20):
+        if dependencies.session_manager.halted:
+            break
+        await asyncio.sleep(0)
+    assert dependencies.session_manager.halted is True
     assert session.orders == []
 
 

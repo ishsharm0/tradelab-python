@@ -6,6 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from tradelab.cli import app
@@ -184,3 +185,42 @@ def test_status_reads_one_persisted_namespace(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["state"]["equity"] == 12_345
     assert payload["trades"] == 1
+
+
+def test_paper_command_replays_csv_without_credentials(tmp_path: Path) -> None:
+    csv_path = _csv(tmp_path / "paper.csv")
+    result = RUNNER.invoke(
+        app,
+        [
+            "paper",
+            "--symbol",
+            "TEST",
+            "--interval",
+            "1m",
+            "--csv-path",
+            str(csv_path),
+            "--strategy",
+            "buy-hold",
+            "--warmup-bars",
+            "0",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["symbol"] == "TEST"
+    assert payload["barsProcessed"] == 3
+    assert payload["mode"] == "paper"
+
+
+def test_live_command_fails_closed_for_rest_only_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRADELAB_ALLOW_LIVE", "true")
+    result = RUNNER.invoke(
+        app,
+        ["live", "--broker", "alpaca", "--symbol", "AAPL", "--confirm-live"],
+    )
+    assert result.exit_code != 0
+    assert "streaming order updates" in result.output

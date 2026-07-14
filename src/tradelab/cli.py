@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 from collections.abc import Callable, Coroutine, Mapping
 from pathlib import Path
 from types import ModuleType
@@ -12,10 +13,16 @@ from typing import Any, TypeVar, cast
 
 import typer
 
+from tradelab.brokers import (
+    AlpacaBroker,
+    BinanceBroker,
+    CoinbaseBroker,
+    InteractiveBrokersBroker,
+)
 from tradelab.data import get_historical_candles, load_candles_from_csv, save_candles_to_cache
 from tradelab.engine import backtest, backtest_portfolio, grid, walk_forward_optimize
-from tradelab.errors import TradeLabError, ValidationError
-from tradelab.live import JsonFileStorage
+from tradelab.errors import LiveTradingDisabledError, TradeLabError, ValidationError
+from tradelab.live import JsonFileStorage, LiveEngine, PaperEngine
 from tradelab.reporting import export_backtest_artifacts, export_metrics_json, summarize
 from tradelab.strategies import get_strategy, list_strategies
 
@@ -83,6 +90,34 @@ def _factory_from_module(module: ModuleType, path: Path) -> StrategyFactory:
     raise ValidationError(
         f'strategy module "{path}" must define create_signal(params) or signal(context)'
     )
+
+
+def _live_broker(name: str) -> object:
+    normalized = name.strip().lower()
+    factories: dict[str, Callable[[], object]] = {
+        "alpaca": AlpacaBroker,
+        "binance": BinanceBroker,
+        "coinbase": CoinbaseBroker,
+        "ib": InteractiveBrokersBroker,
+        "interactive-brokers": InteractiveBrokersBroker,
+    }
+    factory = factories.get(normalized)
+    if factory is None:
+        raise ValidationError(f'unsupported broker "{name}"')
+    return factory()
+
+
+def _broker_config(name: str) -> dict[str, object]:
+    prefix = name.strip().upper().replace("-", "_")
+    return {
+        "api_key": os.environ.get(f"TRADELAB_{prefix}_API_KEY", ""),
+        "api_secret": os.environ.get(f"TRADELAB_{prefix}_API_SECRET", ""),
+        "passphrase": os.environ.get(f"TRADELAB_{prefix}_PASSPHRASE", ""),
+        "host": os.environ.get("TRADELAB_IB_HOST", "127.0.0.1"),
+        "port": int(os.environ.get("TRADELAB_IB_PORT", "7497")),
+        "client_id": int(os.environ.get("TRADELAB_IB_CLIENT_ID", "1")),
+        "paper": False,
+    }
 
 
 def _version_callback(value: bool) -> None:
@@ -422,6 +457,106 @@ def portfolio(
                 allow_nan=False,
             )
         )
+    except typer.BadParameter:
+        raise
+    except (TradeLabError, OSError, ValueError) as error:
+        _fail(error)
+
+
+@app.command()
+def paper(
+    symbol: str = typer.Option("SPY"),
+    interval: str = typer.Option("1m"),
+    strategy: str = typer.Option("buy-hold"),
+    params: str = typer.Option("{}", help="Strategy parameters as JSON."),
+    csv_path: Path | None = typer.Option(None, exists=True, dir_okay=False),
+    state_dir: Path = typer.Option(Path("output/live-state")),
+    equity: float = typer.Option(10_000, min=0),
+    risk_pct: float = typer.Option(1, min=0),
+    warmup_bars: int = typer.Option(0, min=0),
+) -> None:
+    """Replay optional CSV bars through the credential-free paper live engine."""
+
+    async def run() -> dict[str, object]:
+        broker = PaperEngine(equity=equity)
+        signal = _load_strategy_factory(strategy)(_json_mapping(params, "params"))
+        engine = LiveEngine(
+            id=f"paper-{symbol}-{interval}",
+            symbol=symbol,
+            interval=interval,
+            signal=signal,
+            broker=broker,
+            storage=JsonFileStorage(base_dir=state_dir),
+            equity=equity,
+            risk_pct=risk_pct,
+            warmup_bars=warmup_bars,
+        )
+        bars = load_candles_from_csv(csv_path) if csv_path is not None else []
+        await engine.start()
+        try:
+            for bar in bars:
+                await broker.simulate_bar(symbol, interval, bar)
+            return {"mode": "paper", "barsProcessed": len(bars), **engine.get_status()}
+        finally:
+            await engine.stop()
+
+    try:
+        typer.echo(json.dumps(_run(run()), indent=2, allow_nan=False))
+    except typer.BadParameter:
+        raise
+    except (TradeLabError, OSError, ValueError) as error:
+        _fail(error)
+
+
+@app.command()
+def live(
+    broker: str = typer.Option(..., help="Broker: alpaca, binance, coinbase, or ib."),
+    symbol: str = typer.Option(...),
+    interval: str = typer.Option("1m"),
+    strategy: str = typer.Option("ema-cross"),
+    params: str = typer.Option("{}", help="Strategy parameters as JSON."),
+    state_dir: Path = typer.Option(Path("output/live-state")),
+    confirm_live: bool = typer.Option(False, "--confirm-live"),
+    warmup_bars: int = typer.Option(200, min=0),
+    watch: bool = typer.Option(False, "--watch", help="Run until interrupted."),
+) -> None:
+    """Start a permission-gated live engine; uncertified adapters fail closed."""
+    try:
+        if os.environ.get("TRADELAB_ALLOW_LIVE") != "true" or confirm_live is not True:
+            raise LiveTradingDisabledError(
+                "live requires TRADELAB_ALLOW_LIVE=true and --confirm-live"
+            )
+        adapter = _live_broker(broker)
+        supports_updates = getattr(adapter, "supports_order_updates", None)
+        if not callable(supports_updates) or supports_updates() is not True:
+            raise LiveTradingDisabledError(
+                f"{broker} lacks certified streaming order updates; live execution is disabled"
+            )
+        signal = _load_strategy_factory(strategy)(_json_mapping(params, "params"))
+
+        async def run() -> dict[str, object]:
+            engine = LiveEngine(
+                id=f"live-{broker}-{symbol}-{interval}",
+                symbol=symbol,
+                interval=interval,
+                signal=signal,
+                broker=adapter,
+                broker_config=_broker_config(broker),
+                storage=JsonFileStorage(base_dir=state_dir),
+                warmup_bars=warmup_bars,
+                confirm_live=True,
+            )
+            await engine.start()
+            try:
+                if watch:
+                    await asyncio.Event().wait()
+                else:
+                    await engine.poll_once()
+                return {"mode": "live", **engine.get_status()}
+            finally:
+                await engine.stop()
+
+        typer.echo(json.dumps(_run(run()), indent=2, allow_nan=False))
     except typer.BadParameter:
         raise
     except (TradeLabError, OSError, ValueError) as error:
