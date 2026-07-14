@@ -32,6 +32,7 @@ jobs:
       - run: uv run pytest -q
 
   quality:
+    name: Quality
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -47,6 +48,7 @@ jobs:
       - run: uv run mypy --strict src examples scripts
 
   network-audit:
+    name: Network audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -70,6 +72,7 @@ jobs:
           exit "$status"
 
   build:
+    name: Build installed artifact
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: publish-${{ github.event.release.tag_name }}
@@ -14,8 +13,12 @@ concurrency:
 
 jobs:
   publish:
+    name: Verify and publish distribution
     if: startsWith(github.event.release.tag_name, 'v') && vars.PYPI_PUBLISH_ENABLED == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Required for PyPI Trusted Publishing's short-lived OIDC exchange.
     environment:
       name: pypi
       url: https://pypi.org/project/tradelab-python/
