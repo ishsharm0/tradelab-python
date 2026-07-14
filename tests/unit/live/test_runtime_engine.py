@@ -100,6 +100,40 @@ async def test_handle_bar_serializes_slow_signals_and_deduplicates_time(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_accepted_exit_is_not_resubmitted_on_later_triggering_bars(tmp_path: Path) -> None:
+    broker = PaperEngine()
+    engine = LiveEngine(
+        id="single-exit",
+        symbol="A",
+        signal=lambda _context: None,
+        broker=broker,
+        storage=JsonFileStorage(base_dir=tmp_path),
+        warmup_bars=0,
+    )
+    await engine.start()
+    engine.open_position = {
+        "id": "trade-1",
+        "symbol": "A",
+        "side": "long",
+        "size": 1,
+        "entry": 100,
+        "entryFill": 100,
+        "stop": 98,
+        "takeProfit": 104,
+        "openTime": 1,
+        "_openedAtIndex": 0,
+    }
+
+    await engine.handle_bar(_bar(1_735_828_200_000, 98, high=99, low=97))
+    await engine.handle_bar(_bar(1_735_828_260_000, 97, high=98, low=96))
+
+    assert len(await broker.get_open_orders()) == 1
+    assert engine.open_position["_pendingExitOrderId"] == "paper-1"
+    assert engine.open_position["_pendingExitClientOrderId"].startswith("single-exit-exit-")
+    await engine.stop()
+
+
+@pytest.mark.asyncio
 async def test_start_failure_rolls_back_feed_broker_and_listeners(tmp_path: Path) -> None:
     class BrokenFeed(BrokerFeed):
         disconnected = False

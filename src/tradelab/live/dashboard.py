@@ -16,12 +16,11 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 _HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>tradelab live</title></head>
-<body><h1>tradelab live</h1><pre id="state"></pre>
-<script>fetch('/state').then(r=>r.json()).then(s=>state.textContent=JSON.stringify(s,null,2));</script>
+<body><h1>tradelab live</h1><p>Use the authenticated local API to inspect runtime state.</p>
 </body></html>"""
 
 
@@ -60,8 +59,10 @@ class DashboardServer:
             loopback = host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
         except ValueError:
             loopback = False
-        if not loopback and allow_remote is not True:
-            raise ValueError("non-loopback dashboard host requires allow_remote=True")
+        if not loopback:
+            raise ValueError(
+                "non-loopback dashboard binding is disabled; use an authenticated TLS proxy"
+            )
         if command_token is not None and (not isinstance(command_token, str) or not command_token):
             raise ValueError("command_token must be a non-empty string")
         self.source = source
@@ -123,8 +124,7 @@ class DashboardServer:
         return dict(result) if isinstance(result, Mapping) else {}
 
     async def _command(self, request: Request) -> JSONResponse:
-        supplied = request.headers.get("X-Tradelab-Token", "")
-        if not hmac.compare_digest(supplied, self.command_token):
+        if not self._authorized(request):
             return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
         if int(request.headers.get("content-length", "0") or 0) > 65_536:
             return JSONResponse({"ok": False, "error": "command body too large"}, status_code=413)
@@ -161,6 +161,10 @@ class DashboardServer:
             return JSONResponse({"ok": False, "error": "command failed"}, status_code=500)
         return JSONResponse({"ok": True})
 
+    def _authorized(self, request: Request) -> bool:
+        supplied = request.headers.get("X-Tradelab-Token", "")
+        return hmac.compare_digest(supplied, self.command_token)
+
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="tradelab live", docs_url=None, redoc_url=None)
 
@@ -169,15 +173,19 @@ class DashboardServer:
             return _HTML
 
         @app.get("/state")
-        async def state() -> JSONResponse:
+        async def state(request: Request) -> JSONResponse:
+            if not self._authorized(request):
+                return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
             return JSONResponse(await self._state())
 
         @app.post("/command")
         async def command(request: Request) -> JSONResponse:
             return await self._command(request)
 
-        @app.get("/events")
-        async def events() -> StreamingResponse:
+        @app.get("/events", response_model=None)
+        async def events(request: Request) -> Response:
+            if not self._authorized(request):
+                return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
             return StreamingResponse(
                 self.event_stream(),
                 media_type="text/event-stream",

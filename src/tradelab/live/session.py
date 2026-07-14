@@ -325,6 +325,27 @@ class TradingSession:
             if _matches(staged, order):
                 self._pending_brackets.pop(symbol, None)
                 break
+        for symbol, bracket in tuple(self.brackets.items()):
+            order_id = str(order.get("orderId") or "")
+            if order_id not in {bracket.get("stopId"), bracket.get("targetId")}:
+                continue
+            if symbol in self._oco_winners:
+                return
+            leg = "stop" if order_id == bracket.get("stopId") else "target"
+            reason = f"protective {leg} order {event.removeprefix('order:')}"
+            self.risk_manager.halt(reason)
+            self._record("risk:halt", {"symbol": symbol, "reason": reason})
+            sibling = bracket.get("targetId") if leg == "stop" else bracket.get("stopId")
+            if sibling:
+                self._oco_winners[symbol] = {
+                    "siblingId": str(sibling),
+                    "winnerId": order_id,
+                    "reason": "PROTECTIVE_LEG_TERMINATED",
+                }
+                self._spawn(self._cancel_oco_sibling(symbol, sibling))
+            else:
+                self.brackets.pop(symbol, None)
+            return
 
     def _on_broker_fill(self, order: dict[str, Any]) -> None:
         self._record("order:filled", self._with_meta(order))
@@ -666,6 +687,11 @@ class TradingSession:
                     }
                 )
             )
+            if order.get("status") == "rejected":
+                reason = "protective stop order rejected"
+                self.risk_manager.halt(reason)
+                self._record("risk:halt", {"symbol": symbol, "reason": reason})
+                raise RuntimeError(reason)
             bracket["stopId"] = str(order["orderId"])
         if target_price is not None:
             client_id = self._next_client_id("target")
@@ -684,6 +710,8 @@ class TradingSession:
                         }
                     )
                 )
+                if order.get("status") == "rejected":
+                    raise RuntimeError("protective target order rejected")
             except BaseException:
                 stop_id = bracket.get("stopId")
                 if stop_id is not None:

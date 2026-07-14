@@ -44,8 +44,8 @@ async def test_dashboard_html_state_and_command_allowlist() -> None:
     transport = httpx.ASGITransport(app=dashboard.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         root = await client.get("/")
-        state = await client.get("/state")
         headers = {"X-Tradelab-Token": "test-token"}
+        state = await client.get("/state", headers=headers)
         flatten = await client.post("/command", json={"type": "flatten"}, headers=headers)
         close = await client.post(
             "/command", json={"type": "closePosition", "symbol": "MSFT"}, headers=headers
@@ -119,9 +119,11 @@ async def test_dashboard_command_requires_secret_header() -> None:
             headers={"X-Tradelab-Token": "known-secret"},
         )
         state = await client.get("/state")
+        events = await client.get("/events")
     assert missing.status_code == wrong.status_code == 403
     assert missing.json() == wrong.json() == {"ok": False, "error": "forbidden"}
     assert correct.json() == {"ok": True}
+    assert state.status_code == events.status_code == 403
     assert "known-secret" not in state.text
     assert source.calls == [("flatten", None)]
     await dashboard.close()
@@ -173,7 +175,9 @@ async def test_dashboard_actual_server_defaults_to_loopback_and_closes() -> None
     url = await dashboard.start()
     assert url.startswith("http://127.0.0.1:")
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"{url}/state")
+        response = await client.get(
+            f"{url}/state", headers={"X-Tradelab-Token": dashboard.command_token}
+        )
     assert response.status_code == 200
     await dashboard.close()
     await dashboard.close()
@@ -190,5 +194,5 @@ def test_dashboard_requires_event_source_and_valid_limits() -> None:
         DashboardServer(source=Source(), command_token="")
     with pytest.raises(ValueError, match="non-loopback"):
         DashboardServer(source=Source(), host="0.0.0.0")
-    remote = DashboardServer(source=Source(), host="0.0.0.0", allow_remote=True)
-    assert remote.host == "0.0.0.0"
+    with pytest.raises(ValueError, match="TLS proxy"):
+        DashboardServer(source=Source(), host="0.0.0.0", allow_remote=True)

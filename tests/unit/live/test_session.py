@@ -150,6 +150,31 @@ async def test_bracket_oco_and_wide_bar_fill_exactly_one_exit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_protective_leg_rejection_halts_and_cancels_sibling() -> None:
+    broker = PaperEngine()
+    session = await _session(broker=broker)
+    await session.push_bar(_bar(1, 100))
+    await session.place_order(side="long", qty=1, stop=98, target=104)
+    stop_id = session.brackets["AAPL"]["stopId"]
+    target_id = session.brackets["AAPL"]["targetId"]
+
+    broker._reject_order(broker.open_orders[stop_id], "venue rejected protective stop")
+    await session.refresh()
+
+    assert session.risk_manager.halted is True
+    assert session.risk_manager.halt_reason == "protective stop order rejected"
+    assert session.brackets == {}
+    assert await broker.get_open_orders() == []
+    assert (await broker.get_order_status(target_id))["status"] == "canceled"
+    assert any(
+        event["event"] == "risk:halt"
+        and event["payload"].get("reason") == "protective stop order rejected"
+        for event in session.recent_events()
+    )
+    await session.stop()
+
+
+@pytest.mark.asyncio
 async def test_resting_limit_attaches_bracket_after_fill() -> None:
     session = await _session()
     await session.push_bar(_bar(1, 100))

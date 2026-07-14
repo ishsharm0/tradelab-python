@@ -389,6 +389,18 @@ class LiveEngine:
         if _matches(self.pending_order, order):
             self.pending_order = None
             self._spawn(self._persist_state())
+            return
+        if self.open_position and _matches(
+            {
+                "orderId": self.open_position.get("_pendingExitOrderId"),
+                "clientOrderId": self.open_position.get("_pendingExitClientOrderId"),
+            },
+            order,
+        ):
+            reason = f"exit order {event.removeprefix('order:')}"
+            self.risk_manager.halt(reason)
+            self._emit("risk:halt", {"symbol": self.symbol, "reason": reason})
+            self._spawn(self._persist_state())
 
     async def _finalize_trade(self, trade: Mapping[str, Any]) -> None:
         await self.state_manager.append_trade(self.namespace, trade)
@@ -531,21 +543,36 @@ class LiveEngine:
     async def _submit_exit(self, reason: str, price: float, kind: str = "market") -> None:
         if self.open_position is None:
             return
+        if self.open_position.get("_pendingExitClientOrderId"):
+            return
+        client_id = f"{self.namespace}-exit-{self._now_ms()}"
         self.open_position["_pendingExitReason"] = reason
         self.open_position["_pendingExitPriceHint"] = price
-        receipt = _order(
-            await self.broker.submit_order(
-                {
-                    "symbol": self.symbol,
-                    "side": self._opposite(self.open_position["side"]),
-                    "type": kind,
-                    "qty": self.open_position["size"],
-                    "limitPrice": price if kind == "limit" else None,
-                    "stopPrice": price if kind == "stop" else None,
-                    "clientOrderId": f"{self.namespace}-exit-{self._now_ms()}",
-                }
+        self.open_position["_pendingExitClientOrderId"] = client_id
+        try:
+            receipt = _order(
+                await self.broker.submit_order(
+                    {
+                        "symbol": self.symbol,
+                        "side": self._opposite(self.open_position["side"]),
+                        "type": kind,
+                        "qty": self.open_position["size"],
+                        "limitPrice": price if kind == "limit" else None,
+                        "stopPrice": price if kind == "stop" else None,
+                        "clientOrderId": client_id,
+                    }
+                )
             )
-        )
+        except BaseException:
+            self.risk_manager.halt("exit order submission outcome unknown")
+            self._emit(
+                "risk:halt",
+                {"symbol": self.symbol, "reason": self.risk_manager.halt_reason},
+            )
+            await self._persist_state()
+            raise
+        if self.open_position is not None:
+            self.open_position["_pendingExitOrderId"] = receipt.get("orderId")
         await self._drain_event_tasks()
         if receipt.get("status") == "filled" and self.open_position is not None:
             self._on_order_filled(receipt)
