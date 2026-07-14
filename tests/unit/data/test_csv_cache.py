@@ -7,7 +7,6 @@ from datetime import UTC, datetime
 
 import pytest
 
-import tradelab.data.cache as cache_module
 from tradelab.data import (
     cached_candles_path,
     candle_stats,
@@ -233,14 +232,12 @@ def test_cache_atomic_failure_preserves_existing_file_and_removes_temporary(
     path.write_text("existing", encoding="utf-8")
     if failure == "serialize":
         monkeypatch.setattr(
-            cache_module.json,
-            "dump",
+            "tradelab.data.cache.json.dump",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("boom")),
         )
     else:
         monkeypatch.setattr(
-            cache_module.os,
-            "replace",
+            "tradelab.data.cache.os.replace",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("boom")),
         )
 
