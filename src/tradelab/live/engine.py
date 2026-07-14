@@ -848,6 +848,22 @@ class LiveEngine:
             try:
                 await self._drain_event_tasks()
                 if flatten_on_shutdown and self.open_position:
+                    pending_exit_id = self.open_position.get("_pendingExitOrderId")
+                    pending_exit_client_id = self.open_position.get("_pendingExitClientOrderId")
+                    if pending_exit_client_id:
+                        if not pending_exit_id:
+                            raise RuntimeError(
+                                "cannot safely flatten while an exit submission outcome is unknown"
+                            )
+                        await self.broker.cancel_order(str(pending_exit_id))
+                        if self.open_position is not None:
+                            for key in (
+                                "_pendingExitOrderId",
+                                "_pendingExitClientOrderId",
+                                "_pendingExitReason",
+                                "_pendingExitPriceHint",
+                            ):
+                                self.open_position.pop(key, None)
                     await self._submit_exit(
                         "SHUTDOWN", self._current_mark(float(self.open_position["entryFill"]))
                     )

@@ -135,7 +135,17 @@ async def test_accepted_exit_is_not_resubmitted_on_later_triggering_bars(tmp_pat
         "clientOrderId": engine.open_position["_pendingExitClientOrderId"],
         "reason": "SL",
     }
-    await engine.stop()
+    broker.positions["A"] = {
+        "symbol": "A",
+        "side": "long",
+        "qty": 1,
+        "avgEntry": 100,
+    }
+    broker.last_prices["A"] = 97
+    await engine.stop(flatten_on_shutdown=True)
+    assert engine.open_position is None
+    assert await broker.get_positions() == []
+    assert (await broker.get_order_status("paper-1"))["status"] == "canceled"
 
 
 @pytest.mark.asyncio
