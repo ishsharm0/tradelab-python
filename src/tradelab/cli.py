@@ -11,8 +11,8 @@ from typing import Any, TypeVar
 import typer
 
 from tradelab.data import get_historical_candles, load_candles_from_csv, save_candles_to_cache
-from tradelab.engine import backtest, grid, walk_forward_optimize
-from tradelab.errors import TradeLabError
+from tradelab.engine import backtest, backtest_portfolio, grid, walk_forward_optimize
+from tradelab.errors import TradeLabError, ValidationError
 from tradelab.reporting import export_backtest_artifacts, export_metrics_json, summarize
 from tradelab.strategies import get_strategy, list_strategies
 
@@ -320,6 +320,66 @@ def walk_forward_command(
                     "positions": len(result["positions"]),
                     "finalEquity": result["metrics"]["finalEquity"],
                     "bestParamsSummary": result["bestParamsSummary"],
+                    "metricsPath": str(metrics_path),
+                },
+                indent=2,
+                allow_nan=False,
+            )
+        )
+    except typer.BadParameter:
+        raise
+    except (TradeLabError, OSError, ValueError) as error:
+        _fail(error)
+
+
+@app.command()
+def portfolio(
+    csv_paths: str = typer.Option(..., help="Comma-separated CSV paths."),
+    symbols: str = typer.Option("", help="Comma-separated symbols."),
+    strategy: str = typer.Option("buy-hold"),
+    params: str = typer.Option("{}", help="Strategy parameters as JSON."),
+    interval: str = typer.Option("mixed"),
+    equity: float = typer.Option(10_000, min=0),
+    out_dir: Path = typer.Option(Path("output")),
+) -> None:
+    """Run several CSV datasets against one shared-capital portfolio."""
+    try:
+        paths = [Path(value.strip()) for value in csv_paths.split(",") if value.strip()]
+        if not paths:
+            raise ValidationError("portfolio requires at least one CSV path")
+        names = [value.strip() for value in symbols.split(",") if value.strip()]
+        strategy_params = _json_mapping(params, "params")
+        factory = get_strategy(strategy)
+        systems = [
+            {
+                "symbol": names[index] if index < len(names) else f"asset-{index + 1}",
+                "candles": load_candles_from_csv(path),
+                "signal": factory(strategy_params),
+                "warmup_bars": 0,
+                "flatten_at_close": False,
+            }
+            for index, path in enumerate(paths)
+        ]
+        result = backtest_portfolio(
+            systems=systems,
+            equity=equity,
+            interval=interval,
+            collect_replay=False,
+            collect_eq_series=True,
+        )
+        metrics_path = export_metrics_json(
+            result,
+            symbol="PORTFOLIO",
+            interval=interval,
+            range_="custom",
+            out_dir=out_dir,
+        )
+        typer.echo(
+            json.dumps(
+                {
+                    "systems": len(result["systems"]),
+                    "positions": len(result["positions"]),
+                    "finalEquity": result["metrics"]["finalEquity"],
                     "metricsPath": str(metrics_path),
                 },
                 indent=2,

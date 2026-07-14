@@ -117,3 +117,26 @@ def test_cli_rejects_bad_json_and_unknown_preset(tmp_path: Path) -> None:
     )
     assert unknown.exit_code != 0
     assert "Unknown strategy" in unknown.output
+
+
+def test_portfolio_command_runs_multiple_csv_systems(tmp_path: Path) -> None:
+    first = _csv(tmp_path / "first.csv")
+    second = _csv(tmp_path / "second.csv")
+    result = RUNNER.invoke(
+        app,
+        [
+            "portfolio",
+            "--csv-paths",
+            f"{first},{second}",
+            "--symbols",
+            "ONE,TWO",
+            "--params",
+            '{"holdBars": 1}',
+            "--out-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["systems"] == 2
+    assert Path(payload["metricsPath"]).exists()
