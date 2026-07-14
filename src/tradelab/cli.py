@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
-from collections.abc import Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from pathlib import Path
-from typing import Any, TypeVar
+from types import ModuleType
+from typing import Any, TypeVar, cast
 
 import typer
 
@@ -19,6 +21,8 @@ from tradelab.strategies import get_strategy, list_strategies
 
 VERSION = "1.3.1"
 T = TypeVar("T")
+Strategy = Callable[[Mapping[str, Any]], object]
+StrategyFactory = Callable[[Mapping[str, object]], Strategy]
 
 app = typer.Typer(
     name="tradelab",
@@ -48,6 +52,37 @@ def _fail(error: Exception) -> None:
 
 def _paths(value: Mapping[str, object]) -> dict[str, str | None]:
     return {key: None if path is None else str(path) for key, path in value.items()}
+
+
+def _load_strategy_factory(value: str) -> StrategyFactory:
+    """Resolve a registered strategy or an explicit local Python module."""
+    path = Path(value).expanduser()
+    if path.suffix != ".py" and not path.exists():
+        return cast(StrategyFactory, get_strategy(value))
+    if not path.is_file():
+        raise ValidationError(f'strategy module "{path}" does not exist or is not a file')
+    resolved = path.resolve()
+    spec = importlib.util.spec_from_file_location(
+        f"tradelab_user_strategy_{abs(hash(resolved))}", resolved
+    )
+    if spec is None or spec.loader is None:
+        raise ValidationError(f'cannot load strategy module "{resolved}"')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return _factory_from_module(module, resolved)
+
+
+def _factory_from_module(module: ModuleType, path: Path) -> StrategyFactory:
+    factory = getattr(module, "create_signal", None)
+    if callable(factory):
+        return cast(StrategyFactory, factory)
+    signal = getattr(module, "signal", None)
+    if callable(signal):
+        strategy = cast(Strategy, signal)
+        return lambda _parameters: strategy
+    raise ValidationError(
+        f'strategy module "{path}" must define create_signal(params) or signal(context)'
+    )
 
 
 def _version_callback(value: bool) -> None:
@@ -124,7 +159,7 @@ def backtest_command(
                 cache=cache,
             )
         )
-        signal = get_strategy(strategy)(strategy_params)
+        signal = _load_strategy_factory(strategy)(strategy_params)
         result = backtest(
             candles=candles,
             symbol=symbol or "DATA",
@@ -180,7 +215,7 @@ def run_preset_command(
                 cache=cache,
             )
         )
-        signal = get_strategy(preset)(_json_mapping(params, "params"))
+        signal = _load_strategy_factory(preset)(_json_mapping(params, "params"))
         result = backtest(
             candles=candles,
             symbol=symbol or "PRESET",
@@ -294,7 +329,7 @@ def walk_forward_command(
                 cache=cache,
             )
         )
-        factory = get_strategy(strategy)
+        factory = _load_strategy_factory(strategy)
         parameter_sets = grid(_json_mapping(parameter_grid, "grid"))
         result = walk_forward_optimize(
             candles=candles,
@@ -350,7 +385,7 @@ def portfolio(
             raise ValidationError("portfolio requires at least one CSV path")
         names = [value.strip() for value in symbols.split(",") if value.strip()]
         strategy_params = _json_mapping(params, "params")
-        factory = get_strategy(strategy)
+        factory = _load_strategy_factory(strategy)
         systems = [
             {
                 "symbol": names[index] if index < len(names) else f"asset-{index + 1}",

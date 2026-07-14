@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ from mcp.types import (
 )
 
 import tradelab.mcp.server as mcp_server
+from tradelab.errors import LiveTradingDisabledError
 from tradelab.mcp import (
     DESCRIPTIONS,
     SCHEMAS,
@@ -515,6 +517,39 @@ async def test_attached_strategy_and_order_failures_are_reported() -> None:
     session.order_error = RuntimeError("broker rejected")
     with pytest.raises(RuntimeError, match="broker rejected"):
         await tools["feed_price"].handler({"sessionId": "demo", "price": 100})
+
+
+@pytest.mark.asyncio
+async def test_halt_all_blocks_an_inflight_attached_strategy_order() -> None:
+    evaluating = asyncio.Event()
+    release = asyncio.Event()
+
+    async def signal(_context: Mapping[str, Any]) -> dict[str, object]:
+        evaluating.set()
+        await release.wait()
+        return {"side": "long", "qty": 1}
+
+    dependencies = _deps(strategy_factory=lambda _params: signal)
+    tools = build_tools(dependencies)
+    await tools["create_session"].handler({"sessionId": "demo", "symbol": "AAPL"})
+    await tools["attach_strategy"].handler(
+        {"sessionId": "demo", "strategy": "slow", "symbol": "AAPL"}
+    )
+    session = dependencies.session_manager.get("demo")
+    assert session is not None
+
+    feed_task = asyncio.create_task(
+        tools["feed_price"].handler({"sessionId": "demo", "price": 100})
+    )
+    await evaluating.wait()
+    halt_task = asyncio.create_task(tools["halt_all"].handler({}))
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(LiveTradingDisabledError, match="kill switch"):
+        await feed_task
+    await halt_task
+    assert session.orders == []
 
 
 @pytest.mark.asyncio

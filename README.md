@@ -159,6 +159,17 @@ tradelab prefetch --symbol SPY --interval 1d --period 1y
 tradelab import-csv ./data/spy.csv --symbol SPY --interval 1d
 ```
 
+`--strategy` accepts either a registered name or a local Python file. A strategy file defines
+`signal(context)` directly, or `create_signal(params)` returning that callable:
+
+```python
+def signal(context):
+    bar = context["bar"]
+    return {"side": "long", "qty": 1, "stop": bar["close"] * 0.98, "rr": 2}
+```
+
+Run it with `tradelab backtest --source csv --csv-path bars.csv --strategy ./strategy.py`.
+
 ## MCP server
 
 ```json

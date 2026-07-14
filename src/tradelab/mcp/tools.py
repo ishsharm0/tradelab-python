@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import math
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
+
+from tradelab.errors import LiveTradingDisabledError
 
 from .schemas import DESCRIPTIONS, SCHEMAS, TOOL_NAMES
 
@@ -221,6 +224,20 @@ def build_tools(dependencies: McpDependencies | None = None) -> dict[str, ToolDe
     """Build all 25 tool definitions around one dependency graph."""
     deps = dependencies or default_dependencies()
     attached: dict[tuple[str, str], Callable[[Mapping[str, Any]], object]] = {}
+    operation_lock = asyncio.Lock()
+    halt_lock = asyncio.Lock()
+    halt_generation = 0
+    halting = False
+
+    @asynccontextmanager
+    async def live_operation() -> AsyncIterator[None]:
+        generation = halt_generation
+        if halting:
+            raise LiveTradingDisabledError("live operation blocked by the kill switch")
+        async with operation_lock:
+            if halting or generation != halt_generation:
+                raise LiveTradingDisabledError("live operation blocked by the kill switch")
+            yield
 
     async def list_strategies_handler(_args: Mapping[str, Any]) -> object:
         return {"strategies": await _call(deps.list_strategies)}
@@ -459,24 +476,27 @@ def build_tools(dependencies: McpDependencies | None = None) -> dict[str, ToolDe
         return {"stats": value, "note": note}
 
     async def create_session_handler(args: Mapping[str, Any]) -> object:
-        options: dict[str, Any] = {
-            "id": args.get("sessionId"),
-            "symbol": args.get("symbol"),
-            "symbols": args.get("symbols"),
-            "mode": args.get("mode", "paper"),
-            "interval": args.get("interval", "1m"),
-            "equity": args.get("equity", 10_000),
-            "confirm_live": args.get("confirmLive", False),
-        }
-        if args.get("riskPct") is not None:
-            options["risk_pct"] = args["riskPct"]
-        if args.get("maxDailyLossPct") is not None:
-            options["max_daily_loss_pct"] = args["maxDailyLossPct"]
-        session = await _maybe_await(deps.session_manager.create(**options))
-        session_id = str(cast(Any, session).id)
-        for key in [key for key in attached if key[0] == session_id]:
-            attached.pop(key, None)
-        return cast(Any, session).get_status()
+        async with live_operation():
+            options: dict[str, Any] = {
+                "id": args.get("sessionId"),
+                "symbol": args.get("symbol"),
+                "symbols": args.get("symbols"),
+                "mode": args.get("mode", "paper"),
+                "interval": args.get("interval", "1m"),
+                "equity": args.get("equity", 10_000),
+                "confirm_live": args.get("confirmLive", False),
+            }
+            if args.get("riskPct") is not None:
+                options["risk_pct"] = args["riskPct"]
+            if args.get("maxDailyLossPct") is not None:
+                options["max_daily_loss_pct"] = args["maxDailyLossPct"]
+            session = await _maybe_await(deps.session_manager.create(**options))
+            if halting:
+                raise LiveTradingDisabledError("session creation interrupted by the kill switch")
+            session_id = str(cast(Any, session).id)
+            for key in [key for key in attached if key[0] == session_id]:
+                attached.pop(key, None)
+            return cast(Any, session).get_status()
 
     async def list_sessions_handler(_args: Mapping[str, Any]) -> object:
         return [session.get_status() for session in deps.session_manager.list()]
@@ -485,86 +505,95 @@ def build_tools(dependencies: McpDependencies | None = None) -> dict[str, ToolDe
         return await _maybe_await(_session(deps, args.get("sessionId")).refresh())
 
     async def feed_price_handler(args: Mapping[str, Any]) -> object:
-        session = _session(deps, args.get("sessionId"))
-        bar = args.get("bar")
-        price = args.get("price")
-        if (
-            bar is None
-            and isinstance(price, (int, float))
-            and not isinstance(price, bool)
-            and math.isfinite(price)
-        ):
-            bar = {
-                "time": deps.now_ms(),
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "volume": 0,
-            }
-        if bar is None:
-            raise ValueError("Provide either `bar` (OHLCV) or `price` (number)")
-        symbol = args.get("symbol")
-        await _maybe_await(session.push_bar(_mapping(bar, "bar"), symbol))
-        effective_symbol = str(symbol or session.symbol)
-        strategy_fn = attached.get((str(session.id), effective_symbol))
-        status = _mapping(session.get_status(), "session status")
-        positions = list(_sequence(status.get("positions", []), "positions"))
-        symbol_positions = [
-            item
-            for item in positions
-            if not _mapping(item, "position").get("symbol")
-            or _mapping(item, "position").get("symbol") == effective_symbol
-        ]
-        if strategy_fn is not None and not symbol_positions:
-            candles = session.candle_buffer_for(effective_symbol)
-            context = {
-                "candles": candles,
-                "index": len(candles) - 1,
-                "bar": candles[-1] if candles else None,
-                "equity": status.get("equity"),
-                "openPosition": None,
-                "pendingOrder": None,
-            }
-            raw_signal = strategy_fn(context)
-            if inspect.isawaitable(raw_signal):
-                raw_signal = await cast(Awaitable[object], raw_signal)
-            if isinstance(raw_signal, Mapping) and any(
-                raw_signal.get(key) for key in ("side", "direction", "action")
+        async with live_operation():
+            session = _session(deps, args.get("sessionId"))
+            bar = args.get("bar")
+            price = args.get("price")
+            if (
+                bar is None
+                and isinstance(price, (int, float))
+                and not isinstance(price, bool)
+                and math.isfinite(price)
             ):
-                order = _signal_order(cast(Mapping[str, Any], raw_signal))
-                order["symbol"] = effective_symbol
-                await _maybe_await(session.place_order(**order))
-        return session.get_status()
+                bar = {
+                    "time": deps.now_ms(),
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "volume": 0,
+                }
+            if bar is None:
+                raise ValueError("Provide either `bar` (OHLCV) or `price` (number)")
+            symbol = args.get("symbol")
+            await _maybe_await(session.push_bar(_mapping(bar, "bar"), symbol))
+            effective_symbol = str(symbol or session.symbol)
+            strategy_fn = attached.get((str(session.id), effective_symbol))
+            status = _mapping(session.get_status(), "session status")
+            positions = list(_sequence(status.get("positions", []), "positions"))
+            symbol_positions = [
+                item
+                for item in positions
+                if not _mapping(item, "position").get("symbol")
+                or _mapping(item, "position").get("symbol") == effective_symbol
+            ]
+            if strategy_fn is not None and not symbol_positions:
+                candles = session.candle_buffer_for(effective_symbol)
+                context = {
+                    "candles": candles,
+                    "index": len(candles) - 1,
+                    "bar": candles[-1] if candles else None,
+                    "equity": status.get("equity"),
+                    "openPosition": None,
+                    "pendingOrder": None,
+                }
+                raw_signal = strategy_fn(context)
+                if inspect.isawaitable(raw_signal):
+                    raw_signal = await cast(Awaitable[object], raw_signal)
+                if halting:
+                    raise LiveTradingDisabledError("strategy order blocked by the kill switch")
+                if isinstance(raw_signal, Mapping) and any(
+                    raw_signal.get(key) for key in ("side", "direction", "action")
+                ):
+                    order = _signal_order(cast(Mapping[str, Any], raw_signal))
+                    order["symbol"] = effective_symbol
+                    await _maybe_await(session.place_order(**order))
+            return session.get_status()
 
     async def place_order_handler(args: Mapping[str, Any]) -> object:
-        session = _session(deps, args.get("sessionId"))
-        return await _maybe_await(
-            session.place_order(
-                side=args.get("side"),
-                type=args.get("type", "market"),
-                qty=args.get("qty"),
-                risk_pct=args.get("riskPct"),
-                stop=args.get("stop"),
-                target=args.get("target"),
-                rr=args.get("rr"),
-                limit_price=args.get("limitPrice"),
-                symbol=args.get("symbol"),
+        async with live_operation():
+            session = _session(deps, args.get("sessionId"))
+            return await _maybe_await(
+                session.place_order(
+                    side=args.get("side"),
+                    type=args.get("type", "market"),
+                    qty=args.get("qty"),
+                    risk_pct=args.get("riskPct"),
+                    stop=args.get("stop"),
+                    target=args.get("target"),
+                    rr=args.get("rr"),
+                    limit_price=args.get("limitPrice"),
+                    symbol=args.get("symbol"),
+                )
             )
-        )
 
     async def close_position_handler(args: Mapping[str, Any]) -> object:
-        return await _maybe_await(
-            _session(deps, args.get("sessionId")).close_position(args.get("symbol"))
-        )
+        async with live_operation():
+            return await _maybe_await(
+                _session(deps, args.get("sessionId")).close_position(args.get("symbol"))
+            )
 
     async def flatten_handler(args: Mapping[str, Any]) -> object:
-        await _maybe_await(_session(deps, args.get("sessionId")).flatten())
-        return {"ok": True}
+        async with live_operation():
+            await _maybe_await(_session(deps, args.get("sessionId")).flatten())
+            return {"ok": True}
 
     async def cancel_order_handler(args: Mapping[str, Any]) -> object:
-        await _maybe_await(_session(deps, args.get("sessionId")).cancel_order(args.get("orderId")))
-        return {"ok": True}
+        async with live_operation():
+            await _maybe_await(
+                _session(deps, args.get("sessionId")).cancel_order(args.get("orderId"))
+            )
+            return {"ok": True}
 
     async def account_handler(args: Mapping[str, Any]) -> object:
         return await _maybe_await(_session(deps, args.get("sessionId")).get_account())
@@ -578,20 +607,32 @@ def build_tools(dependencies: McpDependencies | None = None) -> dict[str, ToolDe
         )
 
     async def attach_strategy_handler(args: Mapping[str, Any]) -> object:
-        session = _session(deps, args.get("sessionId"))
-        factory = await _call(deps.get_strategy, args.get("strategy"))
-        params = cast(Mapping[str, Any], args.get("params") or {})
-        signal = cast(Callable[[Mapping[str, Any]], object], factory)(params)
-        symbol = str(args.get("symbol") or session.symbol)
-        attached[(str(session.id), symbol)] = cast(Callable[[Mapping[str, Any]], object], signal)
-        return {"ok": True, "strategy": args.get("strategy"), "params": dict(params)}
+        async with live_operation():
+            session = _session(deps, args.get("sessionId"))
+            factory = await _call(deps.get_strategy, args.get("strategy"))
+            if halting:
+                raise LiveTradingDisabledError("strategy attachment blocked by the kill switch")
+            params = cast(Mapping[str, Any], args.get("params") or {})
+            signal = cast(Callable[[Mapping[str, Any]], object], factory)(params)
+            symbol = str(args.get("symbol") or session.symbol)
+            attached[(str(session.id), symbol)] = cast(
+                Callable[[Mapping[str, Any]], object], signal
+            )
+            return {"ok": True, "strategy": args.get("strategy"), "params": dict(params)}
 
     async def halt_all_handler(_args: Mapping[str, Any]) -> object:
-        try:
-            await _maybe_await(deps.session_manager.halt_all())
-        finally:
+        nonlocal halt_generation, halting
+        async with halt_lock:
+            halt_generation += 1
+            halting = True
             attached.clear()
-        return {"ok": True, "sessionsHalted": len(deps.session_manager.list())}
+            try:
+                async with operation_lock:
+                    await _maybe_await(deps.session_manager.halt_all())
+            finally:
+                attached.clear()
+                halting = False
+            return {"ok": True, "sessionsHalted": len(deps.session_manager.list())}
 
     async def research_open_handler(args: Mapping[str, Any]) -> object:
         return _camelize(

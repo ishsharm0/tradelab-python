@@ -121,6 +121,37 @@ def test_cli_rejects_bad_json_and_unknown_preset(tmp_path: Path) -> None:
     assert "Unknown strategy" in unknown.output
 
 
+def test_cli_loads_a_python_strategy_module(tmp_path: Path) -> None:
+    csv_path = _csv(tmp_path / "bars.csv")
+    strategy_path = tmp_path / "custom_strategy.py"
+    strategy_path.write_text(
+        "def signal(context):\n"
+        "    if context['index'] == 0:\n"
+        "        close = context['bar']['close']\n"
+        "        return {'side': 'long', 'qty': 1, 'stop': close - 2, 'rr': 2}\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+    result = RUNNER.invoke(
+        app,
+        [
+            "backtest",
+            "--source",
+            "csv",
+            "--csv-path",
+            str(csv_path),
+            "--strategy",
+            str(strategy_path),
+            "--warmup-bars",
+            "0",
+            "--out-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["symbol"] == "DATA"
+
+
 def test_portfolio_command_runs_multiple_csv_systems(tmp_path: Path) -> None:
     first = _csv(tmp_path / "first.csv")
     second = _csv(tmp_path / "second.csv")
