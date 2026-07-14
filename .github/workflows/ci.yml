@@ -47,7 +47,17 @@ jobs:
           python-version: "3.11"
           enable-cache: true
       - run: uv sync --all-extras --locked
-      - run: uv run python scripts/audit_network_calls.py
+      - name: Audit with new external connections blocked
+        run: |
+          sudo iptables -I OUTPUT 1 ! -o lo -m conntrack --ctstate NEW -j REJECT
+          if command -v ip6tables >/dev/null; then
+            sudo ip6tables -I OUTPUT 1 ! -o lo -m conntrack --ctstate NEW -j REJECT
+          fi
+          status=0
+          uv run python scripts/audit_network_calls.py || status=$?
+          sudo iptables -D OUTPUT 1
+          if command -v ip6tables >/dev/null; then sudo ip6tables -D OUTPUT 1; fi
+          exit "$status"
 
   build:
     runs-on: ubuntu-latest
@@ -60,6 +70,9 @@ jobs:
       - run: uv lock --check
       - run: uv build
       - run: uv run twine check dist/*
+      - run: uv venv .release-venv --python 3.11
+      - run: uv pip install --python .release-venv/bin/python dist/*.whl pytest
+      - run: TRADELAB_RELEASE_PYTHON=.release-venv/bin/python .release-venv/bin/python -m pytest tests/e2e/test_installed_package.py -q
       - uses: actions/upload-artifact@v4
         with:
           name: python-distributions
