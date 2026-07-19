@@ -55,4 +55,8 @@ jobs:
       - run: uv venv .release-venv --python 3.11
       - run: uv pip install --python .release-venv/bin/python dist/*.whl pytest pytest-asyncio
       - run: TRADELAB_RELEASE_PYTHON="$PWD/.release-venv/bin/python" .release-venv/bin/python -m pytest tests/e2e/test_installed_package.py -q
-      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}
