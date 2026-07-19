@@ -11,6 +11,14 @@ import pytest
 from tradelab.errors import LiveTradingDisabledError, RiskRejectedError, ValidationError
 from tradelab.live import BrokerAdapter, EventBus, PaperEngine, SessionManager, TradingSession
 
+# Wednesday, 2026-07-15 10:00 America/New_York. Trading tests must not depend on
+# the wall clock of the machine running them (especially weekend CI runs).
+TRADING_TIME_MS = 1_784_124_000_000
+
+
+def _trading_clock_ms() -> int:
+    return TRADING_TIME_MS
+
 
 class SnakeCaseBroker:
     """Credentialed-adapter shape used by the package's REST brokers."""
@@ -99,6 +107,7 @@ def _bar(
 
 async def _session(**kwargs: Any) -> TradingSession:
     broker = cast(BrokerAdapter, kwargs.pop("broker", PaperEngine(equity=10_000)))
+    kwargs.setdefault("clock_ms", _trading_clock_ms)
     session = TradingSession(id="t1", symbol="AAPL", broker=broker, equity=10_000, **kwargs)
     await session.start()
     return session
@@ -199,6 +208,7 @@ async def test_multisymbol_prices_oco_and_exposure_use_each_position_value() -> 
         max_gross_exposure_pct=100,
         qty_step=1,
         min_qty=1,
+        clock_ms=_trading_clock_ms,
     )
     await session.start()
     await session.push_bar(_bar(1, 200), symbol="AAPL")
@@ -260,6 +270,7 @@ async def test_live_session_normalizes_structural_external_broker_payloads(
         broker=broker,
         mode="live",
         confirm_live=True,
+        clock_ms=_trading_clock_ms,
     )
     await session.start()
 
@@ -433,10 +444,10 @@ async def test_failed_bracket_compensation_halts_and_refresh_reconciles() -> Non
 @pytest.mark.asyncio
 async def test_session_manager_create_remove_halt_all_and_duplicate_safety() -> None:
     manager = SessionManager()
-    first = await manager.create(id="one", symbol="A", equity=5_000)
+    first = await manager.create(id="one", symbol="A", equity=5_000, clock_ms=_trading_clock_ms)
     with pytest.raises(ValidationError, match="already exists"):
         await manager.create(id="one", symbol="A")
-    second = await manager.create(id="two", symbol="B", equity=5_000)
+    second = await manager.create(id="two", symbol="B", equity=5_000, clock_ms=_trading_clock_ms)
     await first.push_bar(_bar(1, 10))
     await first.place_order(side="long", qty=2)
     await manager.remove("missing")
